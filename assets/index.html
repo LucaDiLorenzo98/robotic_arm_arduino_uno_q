@@ -1,0 +1,97 @@
+<!--
+SPDX-FileCopyrightText: Copyright (C) ARDUINO SRL (http://www.arduino.cc)
+SPDX-License-Identifier: MPL-2.0
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Face Detection – Servo</title>
+    <link rel="stylesheet" type="text/css" href="style.css">
+</head>
+<body>
+    <div class="app">
+        <header class="header">
+            <h1 class="title">Face Detection – Servo</h1>
+        </header>
+
+        <main class="main-content">
+            <!-- Left: live preview with face detection (iframe shows stream with bounding boxes) -->
+            <section class="container video-section">
+                <div id="videoFeedContainer" class="video-feed-container">
+                    <div id="videoPlaceholder" class="camera-status">
+                        <p class="feedback-text">Searching webcam…</p>
+                    </div>
+                    <iframe id="dynamicIframe" title="Video stream with face detection" class="video-iframe" frameborder="0" style="display: none;"></iframe>
+                </div>
+            </section>
+
+            <!-- Right: state, feedback, pressure, recent detections -->
+            <aside class="right-column">
+                <div class="container container-right">
+                    <div class="state-section">
+                        <h2 class="section-title">State</h2>
+                        <div id="state-content" class="state-content">detect</div>
+                    </div>
+                </div>
+
+                <div class="container container-right">
+                    <div class="feedback-section">
+                        <h2 class="section-title">Feedback</h2>
+                        <div id="feedback-content" class="feedback-content">
+                            <p class="feedback-text">Watching camera. When a face is detected, state goes to grab → release → detect.</p>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="container container-right">
+                    <div class="pressure-section">
+                        <h2 class="section-title">Pressure sensors</h2>
+                        <div class="pressure-readings">
+                            <div class="pressure-row">
+                                <span class="pressure-label">A0</span>
+                                <span id="pressure-a0" class="pressure-value">—</span>
+                            </div>
+                            <div class="pressure-row">
+                                <span class="pressure-label">A1</span>
+                                <span id="pressure-a1" class="pressure-value">—</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="container container-right">
+                    <div class="recent-detections-section">
+                        <h2 class="section-title">Recent detections</h2>
+                        <ul id="recentDetections"></ul>
+                    </div>
+                </div>
+            </aside>
+        </main>
+
+        <div id="error-container" class="error-message" style="display: none;"></div>
+    </div>
+
+    <script>
+        const iframe = document.getElementById('dynamicIframe');
+        const placeholder = document.getElementById('videoPlaceholder');
+        const currentHostname = window.location.hostname;
+        const targetPort = 4912;
+        const targetPath = '/embed';
+        const streamUrl = `http://${currentHostname}:${targetPort}${targetPath}`;
+        let intervalId;
+
+        iframe.onload = () => {
+            if (intervalId) clearInterval(intervalId);
+            placeholder.style.display = 'none';
+            iframe.style.display = 'block';
+        };
+
+        const startLoading = () => { iframe.src = streamUrl; };
+        intervalId = setInterval(startLoading, 1000);
+    </script>
+    <script src="libs/socket.io.min.js"></script>
+    <script src="app.js"></script>
+</body>
+</html>

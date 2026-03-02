@@ -1,0 +1,8 @@
+name: Face Detection Servo
+icon: 🤖
+description: Move a servo on pin 9 when a face is detected. Uses Video Object Detection, Web UI, and Bridge (MCU/MPU).
+
+bricks:
+  - arduino:video_object_detection:
+      model: face-detection
+  - arduino:web_ui
