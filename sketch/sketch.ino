@@ -55,7 +55,7 @@ void setup() {
   servo.attach(SERVO_PIN);
   servo.write(0);
 
-  // STS3215 serial bus on the UART used by Serial (adjust baud if needed)
+  // STS3215 serial bus sulla UART esposta come `Serial` dal core UNO Q
   Serial.begin(1000000);
   sts.pSerial = &Serial;
 

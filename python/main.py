@@ -9,6 +9,41 @@ from datetime import datetime, UTC
 import time
 import threading
 
+# ID dei servo STS3215 (solo 4 presenti sul bus)
+STS_SERVO_IDS = (1, 2, 3, 4)
+STS_CHECK_IDS = STS_SERVO_IDS
+STS_STARTUP_DELAY_SEC = 3.0  # Attesa prima del check (Bridge deve essere pronto)
+
+
+def clear_console():
+    """Pulisce il terminale (ANSI, compatibile con UNO Q / Linux)."""
+    print("\033[2J\033[H", end="")
+    print("=" * 60)
+    print("RUN", datetime.now(UTC).isoformat())
+    print("=" * 60)
+
+
+def _print_sts_servo_info():
+    """Stampa a console ping e posizione per ogni ID STS3215 (per check)."""
+    clear_console()
+    print("[STS3215] Check servo (ping + posizione):\n")
+    for sid in STS_CHECK_IDS:
+        ok = sts_ping(sid)
+        pos = sts_read_pos(sid)
+        pos_str = str(pos) if pos is not None else "—"
+        status = "OK" if ok else "NO"
+        print(f"  ID={sid}  ping={status}  pos={pos_str}")
+    print()
+
+
+def _startup_sts_check():
+    """Esegue il check STS dopo un breve delay (Bridge deve essere connesso)."""
+    time.sleep(STS_STARTUP_DELAY_SEC)
+    try:
+        _print_sts_servo_info()
+    except Exception as e:
+        print(f"[STS3215] startup check failed: {e}")
+
 
 # State machine: detect -> (face) -> grab -> release -> detect
 STATE_DETECT = "detect"
@@ -120,6 +155,39 @@ ui.expose_api("GET", "/api/pressure", get_pressure)
 ui.expose_api("GET", "/api/state", get_state)
 
 
+def get_servo_positions():
+    """GET /api/servo_positions: posizioni attuali dei 4 servo STS3215 (per inizializzare gli slider)."""
+    out = {}
+    for sid in STS_SERVO_IDS:
+        pos = sts_read_pos(sid)
+        out[str(sid)] = pos if pos is not None else None
+    return out
+
+
+def servo_move():
+    """GET /api/servo_move?id=1&position=2048: muove il servo dato alla posizione (0–4095)."""
+    try:
+        from flask import request
+        sid = request.args.get("id")
+        pos = request.args.get("position")
+        if sid is None or pos is None:
+            return {"ok": False, "error": "id and position required"}
+        sid = int(sid)
+        pos = int(pos)
+        if sid not in STS_SERVO_IDS:
+            return {"ok": False, "error": f"id must be in {list(STS_SERVO_IDS)}"}
+        if not 0 <= pos <= 4095:
+            return {"ok": False, "error": "position must be 0–4095"}
+        ok = sts_move_pos(sid, pos)
+        return {"ok": ok}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+ui.expose_api("GET", "/api/servo_positions", get_servo_positions)
+ui.expose_api("GET", "/api/servo_move", servo_move)
+
+
 def _bridge_call_and_unwrap(method: str, *args):
     """Helper: call a Bridge method and unwrap async result objects if needed."""
     res = Bridge.call(method, *args)
@@ -222,5 +290,8 @@ def send_detections_to_ui(detections: dict):
 
 
 detection_stream.on_detect_all(send_detections_to_ui)
+
+# Check STS3215 all'avvio (dopo qualche secondo, così il Bridge è pronto)
+threading.Thread(target=_startup_sts_check, daemon=True).start()
 
 App.run()

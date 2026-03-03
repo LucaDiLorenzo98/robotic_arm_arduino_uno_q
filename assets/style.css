@@ -132,6 +132,43 @@ body {
 .state-content.state-grab { color: #e94560; }
 .state-content.state-release { color: #ffc107; }
 
+.servo-section { margin-bottom: 0; }
+
+.servo-hint {
+    margin: 0 0 0.75rem 0;
+    font-size: 0.85rem;
+    color: #888;
+}
+
+.servo-sliders { display: flex; flex-direction: column; gap: 0.75rem; }
+
+.servo-row {
+    display: grid;
+    grid-template-columns: auto 1fr auto;
+    align-items: center;
+    gap: 0.5rem;
+}
+
+.servo-label {
+    font-size: 0.9rem;
+    color: #aaa;
+    min-width: 4.5rem;
+}
+
+.servo-value {
+    font-family: ui-monospace, monospace;
+    font-size: 0.9rem;
+    color: #4ecca3;
+    text-align: right;
+    min-width: 2.5rem;
+}
+
+.servo-slider {
+    width: 100%;
+    min-width: 0;
+    accent-color: #e94560;
+}
+
 .pressure-section { margin-bottom: 0; }
 
 .pressure-readings { padding: 0.25rem 0; }

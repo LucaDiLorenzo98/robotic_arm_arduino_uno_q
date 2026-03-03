@@ -19,6 +19,7 @@ document.addEventListener('DOMContentLoaded', () => {
     renderDetections();
     startPressurePolling();
     startStatePolling();
+    initServoSliders();
 });
 
 function updateStateDisplay(state) {
@@ -114,6 +115,52 @@ function initSocketIO() {
 function pushDetection(detection) {
     scans.unshift(detection);
     if (scans.length > MAX_RECENT_SCANS) scans.pop();
+}
+
+const STS_POS_MIN = 0;
+const STS_POS_MAX = 4095;
+
+function initServoSliders() {
+    const container = document.getElementById('servoSliders');
+    if (!container) return;
+
+    // Carica posizioni attuali e inizializza gli slider
+    fetch('/api/servo_positions')
+        .then((res) => res.json())
+        .then((data) => {
+            for (let id = 1; id <= 4; id++) {
+                const key = String(id);
+                const pos = data[key];
+                const slider = document.getElementById('servo' + id);
+                const valueEl = document.getElementById('servo' + id + '-value');
+                if (slider && valueEl) {
+                    if (typeof pos === 'number' && pos >= STS_POS_MIN && pos <= STS_POS_MAX) {
+                        slider.value = pos;
+                        valueEl.textContent = pos;
+                    }
+                    slider.addEventListener('input', () => onServoSliderInput(id, slider, valueEl));
+                    slider.addEventListener('change', () => onServoSliderInput(id, slider, valueEl));
+                }
+            }
+        })
+        .catch(() => {
+            container.querySelectorAll('.servo-value').forEach((el) => { el.textContent = '—'; });
+        });
+}
+
+function onServoSliderInput(id, slider, valueEl) {
+    const position = parseInt(slider.value, 10);
+    valueEl.textContent = position;
+    fetch(`/api/servo_move?id=${id}&position=${position}`)
+        .then((res) => res.json())
+        .then((data) => {
+            if (data && !data.ok && data.error) {
+                valueEl.title = data.error;
+            } else if (valueEl.title) {
+                valueEl.title = '';
+            }
+        })
+        .catch(() => { valueEl.title = 'Errore di rete'; });
 }
 
 function renderDetections() {

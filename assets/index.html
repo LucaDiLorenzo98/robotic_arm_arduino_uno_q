@@ -46,6 +46,35 @@ SPDX-License-Identifier: MPL-2.0
                 </div>
 
                 <div class="container container-right">
+                    <div class="servo-section">
+                        <h2 class="section-title">Servo STS3215</h2>
+                        <p class="servo-hint">Sliders partono dalla posizione attuale; spostando muovi il servo.</p>
+                        <div class="servo-sliders" id="servoSliders">
+                            <div class="servo-row" data-id="1">
+                                <label class="servo-label" for="servo1">Servo 1</label>
+                                <span class="servo-value" id="servo1-value">—</span>
+                                <input type="range" id="servo1" class="servo-slider" min="0" max="4095" value="2048" aria-label="Servo 1">
+                            </div>
+                            <div class="servo-row" data-id="2">
+                                <label class="servo-label" for="servo2">Servo 2</label>
+                                <span class="servo-value" id="servo2-value">—</span>
+                                <input type="range" id="servo2" class="servo-slider" min="0" max="4095" value="2048" aria-label="Servo 2">
+                            </div>
+                            <div class="servo-row" data-id="3">
+                                <label class="servo-label" for="servo3">Servo 3</label>
+                                <span class="servo-value" id="servo3-value">—</span>
+                                <input type="range" id="servo3" class="servo-slider" min="0" max="4095" value="2048" aria-label="Servo 3">
+                            </div>
+                            <div class="servo-row" data-id="4">
+                                <label class="servo-label" for="servo4">Servo 4</label>
+                                <span class="servo-value" id="servo4-value">—</span>
+                                <input type="range" id="servo4" class="servo-slider" min="0" max="4095" value="2048" aria-label="Servo 4">
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="container container-right">
                     <div class="pressure-section">
                         <h2 class="section-title">Pressure sensors</h2>
                         <div class="pressure-readings">
