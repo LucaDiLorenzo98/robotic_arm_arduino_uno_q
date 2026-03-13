@@ -389,8 +389,13 @@ def _state_machine_worker():
             time.sleep(GRAB_CLOSE_WAIT_SEC)
             p_closed = get_pressure()
             print(f"[GRAB][PRESSURE][after_pick] A0={p_closed.get('a0')} A1={p_closed.get('a1')}")
-            time.sleep(GRAB_WAIT_BEFORE_HOME_SEC)
             _move_arm_to_home_position()
+            # Keep object clamped until we are back at HOME, then wait user pickup time.
+            time.sleep(GRAB_WAIT_BEFORE_HOME_SEC)
+            _move_servo(GRIPPER_OPEN_ANGLE)
+            time.sleep(0.8)
+            _move_servo(GRIPPER_CLOSED_ANGLE)
+            time.sleep(0.6)
             _slot_grab_count = (_slot_grab_count + 1) % GRAB_SLOT_COUNT_MAX
             print(f"[GRAB] completed slot #{_slot_grab_count if _slot_grab_count > 0 else GRAB_SLOT_COUNT_MAX}")
             _set_state(STATE_DETECT)
