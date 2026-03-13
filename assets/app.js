@@ -12,9 +12,9 @@ let errorContainer = document.getElementById('error-container');
 let faceVisible = false;
 let feedbackTimeout;
 
-const PRESSURE_POLL_MS = 1000; // fast fallback if socket drops
-const STATE_POLL_MS = 1200; // fast fallback if socket drops
-const SERVO_POS_POLL_MS = 1000; // fast fallback if socket drops
+const PRESSURE_POLL_MS = 250; // realtime-like pressure refresh
+const STATE_POLL_MS = 200; // realtime-like state refresh
+const SERVO_POS_POLL_MS = 150; // realtime-like servo position refresh
 const MATRIX_STATUS_POLL_MS = 8000;
 const SERVO_IDS = [1, 2, 3, 4];
 const sliderDragState = { 1: false, 2: false, 3: false, 4: false };

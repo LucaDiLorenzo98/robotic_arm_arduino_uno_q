@@ -33,8 +33,11 @@ def _startup_sts_check():
     """Esegue il check STS dopo un breve delay (Bridge deve essere connesso)."""
     time.sleep(STS_STARTUP_DELAY_SEC)
     try:
-        print("[SETUP] Move robot to HOME and keep still 5s, then FIRST_SLOT and keep still 5s.")
+        print("[SETUP] Move robot to HOME, then hold still 5s.")
+        print("[SETUP] Then move robot to FIRST_SLOT, then hold still 5s.")
+        _set_gripper_idle_closed_free()
         _print_sts_servo_info()
+        print(f"[MATRIX] available={led_matrix_available()}")
     except Exception as e:
         print(f"[STS3215] startup check failed: {e}")
 
@@ -48,9 +51,11 @@ STATE_RELEASE = "release"
 # Gripper servo angles (adjust if your servo is reversed)
 GRIPPER_OPEN_ANGLE = 0
 GRIPPER_CLOSED_ANGLE = 90
+GRIPPER_GRAB_PREOPEN_ANGLE = 25  # "open a little" before slot approach
 
 GRAB_OPEN_WAIT_SEC = 1.0
 GRAB_CLOSE_WAIT_SEC = 1.0
+GRAB_WAIT_BEFORE_HOME_SEC = 15.0
 RELEASE_OPEN_WAIT_SEC = 3.0
 
 # Posizione "home" del braccio STS3215 (RAM-only session).
@@ -70,7 +75,7 @@ FIRST_SLOT_POSITION: dict[int, int] = {}
 
 # Setup automatico: fermo per N secondi -> salva posizione.
 SETUP_STABLE_SECONDS = 5.0
-SETUP_MOVEMENT_THRESHOLD = 12
+SETUP_MOVEMENT_THRESHOLD = 25
 SETUP_NOD_DELTA_SERVO4 = 120
 SETUP_NOD_SPEED = 500
 SETUP_NOD_ACC = 20
@@ -79,8 +84,8 @@ SETUP_NOD_DELAY_SEC = 0.30
 # Grab sequenziale su 9 slot con offset base servo1 configurabile.
 GRAB_SLOT_COUNT_MAX = 9
 GRAB_BASE_SERVO_ID = 1
-GRAB_BASE_OFFSET_STEP = 55
-GRAB_BASE_OFFSET_DIRECTION = 1  # +1 o -1
+GRAB_BASE_OFFSET_STEP = 300
+GRAB_BASE_OFFSET_DIRECTION = -1  # +1 o -1
 
 ui = WebUI()
 detection_stream = VideoObjectDetection(confidence=0.85, debounce_sec=0.0)
@@ -90,6 +95,8 @@ _state_lock = threading.Lock()
 _setup_phase = "home"  # home -> first_slot -> done
 _setup_prev_pose: dict[int, int] | None = None
 _setup_stable_since = 0.0
+_setup_phase_moved = False  # diventa True quando rileva movimento manuale nella fase corrente
+_setup_torque_free_active = False
 _slot_grab_count = 0
 
 # Idle animation (STS3215) configuration
@@ -122,14 +129,6 @@ _idle_traj_state: dict[int, dict[str, float]] = {}
 _idle_lock = threading.Lock()
 _idle_pause_until = 0.0  # timestamp: finché > now, animazione sospesa (es. dopo comando manuale)
 _led_matrix_intensity = LED_MATRIX_DEFAULT_INTENSITY
-_telemetry_lock = threading.Lock()
-_telemetry_cache = {
-    "pressure": {"a0": None, "a1": None},
-    "servo_positions": {str(i): None for i in STS_SERVO_IDS},
-    "updated_at": 0.0,
-}
-
-
 def _validated_home_position(raw) -> dict[int, int]:
     """Validate and normalize home dict from JSON-like data."""
     out: dict[int, int] = {}
@@ -149,16 +148,53 @@ def _validated_home_position(raw) -> dict[int, int]:
     return out
 
 
-def _set_home_from_current_pose():
-    """Set HOME_POSITION from current servo pose at startup (session RAM home)."""
-    global HOME_POSITION
+def _get_request_arg(name: str, fallback=None):
+    """Read query-string arg safely (works even when flask request is unavailable)."""
+    if fallback is not None:
+        return fallback
+    try:
+        from flask import request
+        return request.args.get(name)
+    except Exception:
+        return None
+
+
+def _capture_current_pose() -> dict[int, int] | None:
+    """Read current pose for all configured STS servos and validate it."""
     current = {}
     for sid in STS_SERVO_IDS:
         pos = sts_read_pos(sid)
         if pos is None:
-            return False
+            return None
         current[sid] = int(pos)
     valid = _validated_home_position(current)
+    return valid if valid else None
+
+
+def _pose_payload(pose: dict[int, int]) -> dict[str, int]:
+    return {str(k): int(v) for k, v in pose.items()}
+
+
+def _pause_idle_temporarily():
+    global _idle_pause_until
+    _idle_pause_until = time.time() + IDLE_ANIM_PAUSE_AFTER_MANUAL_SEC
+
+
+def _set_sts_torque_enabled(enabled: bool) -> bool:
+    """Enable/disable torque for all STS servos."""
+    ok_all = True
+    for sid in STS_SERVO_IDS:
+        ok = sts_set_torque(sid, enabled)
+        ok_all = ok_all and ok
+    mode = "ON" if enabled else "OFF"
+    print(f"[STS3215] torque {mode} (all): {ok_all}")
+    return ok_all
+
+
+def _set_home_from_current_pose():
+    """Set HOME_POSITION from current servo pose at startup (session RAM home)."""
+    global HOME_POSITION
+    valid = _capture_current_pose()
     if not valid:
         return False
     HOME_POSITION = dict(valid)
@@ -167,14 +203,7 @@ def _set_home_from_current_pose():
 
 
 def _read_current_pose() -> dict[int, int] | None:
-    pose = {}
-    for sid in STS_SERVO_IDS:
-        pos = sts_read_pos(sid)
-        if pos is None:
-            return None
-        pose[sid] = int(pos)
-    valid = _validated_home_position(pose)
-    return valid if valid else None
+    return _capture_current_pose()
 
 
 def _pose_has_movement(pose_a: dict[int, int], pose_b: dict[int, int], threshold: int) -> bool:
@@ -201,8 +230,11 @@ def _setup_nod_servo4():
 
 def _handle_setup_phase():
     """Auto setup: hold still 5s to capture HOME, then FIRST_SLOT."""
-    global _setup_prev_pose, _setup_stable_since, _setup_phase, HOME_POSITION, FIRST_SLOT_POSITION, _slot_grab_count
+    global _setup_prev_pose, _setup_stable_since, _setup_phase, _setup_phase_moved, _setup_torque_free_active, HOME_POSITION, FIRST_SLOT_POSITION, _slot_grab_count
     now = time.time()
+    if not _setup_torque_free_active:
+        _set_sts_torque_enabled(False)
+        _setup_torque_free_active = True
     pose = _read_current_pose()
     if pose is None:
         return
@@ -210,12 +242,20 @@ def _handle_setup_phase():
     if _setup_prev_pose is None:
         _setup_prev_pose = dict(pose)
         _setup_stable_since = now
+        print(f"[SETUP] Phase={_setup_phase}: move arm by hand, then keep still {SETUP_STABLE_SECONDS:.0f}s.")
         return
 
     moved = _pose_has_movement(pose, _setup_prev_pose, SETUP_MOVEMENT_THRESHOLD)
     _setup_prev_pose = dict(pose)
     if moved:
+        if not _setup_phase_moved:
+            print(f"[SETUP] Phase={_setup_phase}: movement detected, waiting stable hold...")
+        _setup_phase_moved = True
         _setup_stable_since = now
+        return
+
+    # Evita catture premature: la fase si arma solo dopo almeno un movimento manuale.
+    if not _setup_phase_moved:
         return
 
     if (now - _setup_stable_since) < SETUP_STABLE_SECONDS:
@@ -224,8 +264,14 @@ def _handle_setup_phase():
     if _setup_phase == "home":
         HOME_POSITION = dict(pose)
         print(f"[SETUP] HOME captured: {HOME_POSITION}")
+        _set_sts_torque_enabled(True)
+        _setup_torque_free_active = False
         _setup_nod_servo4()
+        _set_sts_torque_enabled(False)
+        _setup_torque_free_active = True
         _setup_phase = "first_slot"
+        _setup_phase_moved = False
+        _setup_prev_pose = None
         _setup_stable_since = now
         return
 
@@ -234,11 +280,20 @@ def _handle_setup_phase():
         _slot_grab_count = 0
         print(f"[SETUP] FIRST_SLOT captured: {FIRST_SLOT_POSITION}")
         _setup_phase = "done"
+        _setup_phase_moved = False
+        _set_sts_torque_enabled(True)
+        _setup_torque_free_active = False
+        print("[SETUP] Returning to HOME before idle.")
+        _move_arm_to_home_position()
         _set_state(STATE_DETECT)
 
 
 def _set_state(new_state: str):
-    global _state
+    global _state, _setup_torque_free_active
+    old_state = _state
+    if old_state == STATE_SETUP and new_state != STATE_SETUP and _setup_torque_free_active:
+        _set_sts_torque_enabled(True)
+        _setup_torque_free_active = False
     with _state_lock:
         _state = new_state
     try:
@@ -257,6 +312,23 @@ def _move_servo(angle: int):
         Bridge.call("move_servo", angle)
     except Exception as e:
         print(f"[StateMachine] move_servo({angle}) error: {e}")
+
+
+def _set_gripper_hold(hold: bool) -> bool:
+    try:
+        res = _bridge_call_and_unwrap("gripper_hold", 1 if hold else 0)
+        return res is not None and int(res) > 0
+    except Exception as e:
+        print(f"[StateMachine] gripper_hold({hold}) error: {e}")
+        return False
+
+
+def _set_gripper_idle_closed_free():
+    # Idle policy: close gripper, then release torque so it is manually movable.
+    _set_gripper_hold(True)
+    _move_servo(GRIPPER_CLOSED_ANGLE)
+    time.sleep(0.2)
+    _set_gripper_hold(False)
 
 
 def _move_arm_to_home_position():
@@ -306,12 +378,18 @@ def _state_machine_worker():
             offset = int(GRAB_BASE_OFFSET_STEP) * int(slot_idx) * int(GRAB_BASE_OFFSET_DIRECTION)
             target_pose[GRAB_BASE_SERVO_ID] = max(0, min(4095, base_raw + offset))
 
-            # Grab sequence: open -> go to first slot (+offset) -> close -> home
-            _move_servo(GRIPPER_OPEN_ANGLE)
+            # Grab sequence: small open -> go to slot (+offset) -> close max -> wait -> home (closed)
+            _set_gripper_hold(True)
+            _move_servo(GRIPPER_GRAB_PREOPEN_ANGLE)
             time.sleep(GRAB_OPEN_WAIT_SEC)
             _move_arm_to_pose(target_pose)
+            p_open = get_pressure()
+            print(f"[GRAB][PRESSURE][open] A0={p_open.get('a0')} A1={p_open.get('a1')}")
             _move_servo(GRIPPER_CLOSED_ANGLE)
             time.sleep(GRAB_CLOSE_WAIT_SEC)
+            p_closed = get_pressure()
+            print(f"[GRAB][PRESSURE][after_pick] A0={p_closed.get('a0')} A1={p_closed.get('a1')}")
+            time.sleep(GRAB_WAIT_BEFORE_HOME_SEC)
             _move_arm_to_home_position()
             _slot_grab_count = (_slot_grab_count + 1) % GRAB_SLOT_COUNT_MAX
             print(f"[GRAB] completed slot #{_slot_grab_count if _slot_grab_count > 0 else GRAB_SLOT_COUNT_MAX}")
@@ -355,50 +433,6 @@ def _slew_towards(current: float, target: float, max_step: float) -> float:
     return current + (max_step if delta > 0 else -max_step)
 
 
-def _telemetry_reader_worker():
-    """Continuously read analog pressure + servo positions from MCU and cache them."""
-    last_log_ts = 0.0
-    while True:
-        now = time.time()
-
-        # Read analog pressure through Bridge.
-        a0 = None
-        a1 = None
-        try:
-            p0 = Bridge.call("read_pressure_a0")
-            p1 = Bridge.call("read_pressure_a1")
-            if hasattr(p0, "result"):
-                p0 = p0.result()
-            if hasattr(p1, "result"):
-                p1 = p1.result()
-            a0 = int(p0) if p0 is not None else None
-            a1 = int(p1) if p1 is not None else None
-        except Exception:
-            pass
-
-        # Read all STS positions continuously.
-        servo_positions = {}
-        for sid in STS_SERVO_IDS:
-            pos = sts_read_pos(sid)
-            servo_positions[str(sid)] = int(pos) if pos is not None else None
-
-        with _telemetry_lock:
-            if a0 is not None or a1 is not None:
-                _telemetry_cache["pressure"] = {"a0": a0, "a1": a1}
-            _telemetry_cache["servo_positions"] = servo_positions
-            _telemetry_cache["updated_at"] = now
-
-        if (now - last_log_ts) >= TELEMETRY_LOG_INTERVAL_SEC:
-            print(
-                "[RT][reader] "
-                f"pressure=({_telemetry_cache['pressure'].get('a0')}, {_telemetry_cache['pressure'].get('a1')}) "
-                f"servo={servo_positions}"
-            )
-            last_log_ts = now
-
-        time.sleep(TELEMETRY_READER_INTERVAL_SEC)
-
-
 def _idle_animation_worker():
     """Animazione 'cerca qualcuno' quando il robot è in stato detect."""
     global _idle_pause_until, _idle_traj_state
@@ -423,6 +457,7 @@ def _idle_animation_worker():
 
         # Siamo entrati (o rientrati) nello stato detect: aggiorna le posizioni di base
         if last_state != STATE_DETECT:
+            _set_gripper_idle_closed_free()
             _refresh_idle_base_positions()
         last_state = s
 
@@ -482,22 +517,28 @@ ui.on_message("override_th", lambda sid, threshold: detection_stream.override_th
 
 def get_pressure():
     """GET /api/pressure: return pressure sensor values from A0 and A1."""
-    with _telemetry_lock:
-        p = dict(_telemetry_cache["pressure"])
-    return {"a0": p.get("a0"), "a1": p.get("a1")}
+    try:
+        a0 = _bridge_call_and_unwrap("read_pressure_a0")
+        a1 = _bridge_call_and_unwrap("read_pressure_a1")
+        return {
+            "a0": int(a0) if a0 is not None else None,
+            "a1": int(a1) if a1 is not None else None,
+        }
+    except Exception:
+        return {"a0": None, "a1": None}
 
 
 def _state_for_ui() -> str:
     """Map internal machine state to user-facing state value."""
+    runtime_map = {
+        "grab_running": STATE_GRAB,
+        "release_running": STATE_RELEASE,
+    }
     with _state_lock:
         s = _state
     if s in (STATE_SETUP, STATE_DETECT, STATE_GRAB, STATE_RELEASE):
         return s
-    if s == "grab_running":
-        return STATE_GRAB
-    if s == "release_running":
-        return STATE_RELEASE
-    return STATE_DETECT
+    return runtime_map.get(s, STATE_DETECT)
 
 
 def get_state():
@@ -517,13 +558,7 @@ def set_led_matrix_intensity(value=None):
     """GET /api/led_matrix_intensity?value=0..15."""
     global _led_matrix_intensity
     try:
-        level = value
-        if level is None:
-            try:
-                from flask import request
-                level = request.args.get("value")
-            except Exception:
-                pass
+        level = _get_request_arg("value", value)
         if level is None:
             return {"ok": False, "error": "value required"}
         level = int(level)
@@ -546,10 +581,13 @@ def clear_led_matrix():
 
 
 def _enter_setup_mode():
-    global _setup_phase, _setup_prev_pose, _setup_stable_since, FIRST_SLOT_POSITION, _slot_grab_count
+    global _setup_phase, _setup_prev_pose, _setup_stable_since, _setup_phase_moved, _setup_torque_free_active, FIRST_SLOT_POSITION, _slot_grab_count
     _setup_phase = "home"
     _setup_prev_pose = None
     _setup_stable_since = time.time()
+    _setup_phase_moved = False
+    _set_sts_torque_enabled(False)
+    _setup_torque_free_active = True
     FIRST_SLOT_POSITION = {}
     _slot_grab_count = 0
     _set_state(STATE_SETUP)
@@ -558,13 +596,7 @@ def _enter_setup_mode():
 def set_state_checkpoint(state=None):
     """GET /api/set_state?state=setup|detect|grab|release: force state machine checkpoint."""
     try:
-        new_state = state
-        if new_state is None:
-            try:
-                from flask import request
-                new_state = request.args.get("state")
-            except Exception:
-                pass
+        new_state = _get_request_arg("state", state)
         if new_state is None:
             return {"ok": False, "error": "state required"}
         new_state = str(new_state).strip().lower()
@@ -589,26 +621,22 @@ ui.expose_api("GET", "/api/set_state", set_state_checkpoint)
 
 def get_servo_positions():
     """GET /api/servo_positions: posizioni attuali dei 4 servo STS3215 (per inizializzare gli slider)."""
-    with _telemetry_lock:
-        return dict(_telemetry_cache["servo_positions"])
+    out = {}
+    for sid in STS_SERVO_IDS:
+        pos = sts_read_pos(sid)
+        out[str(sid)] = int(pos) if pos is not None else None
+    return out
 
 
 def set_home_current():
     """GET /api/set_home_current: salva la posizione attuale dei servo come home (RAM)."""
     global HOME_POSITION
-    current = {}
-    for sid in STS_SERVO_IDS:
-        pos = sts_read_pos(sid)
-        if pos is None:
-            return {"ok": False, "error": f"servo {sid} position unavailable"}
-        current[sid] = int(pos)
-
-    valid = _validated_home_position(current)
+    valid = _capture_current_pose()
     if not valid:
-        return {"ok": False, "error": "invalid current home position"}
+        return {"ok": False, "error": "current servo pose unavailable or invalid"}
 
     HOME_POSITION = dict(valid)
-    payload = {str(k): int(v) for k, v in HOME_POSITION.items()}
+    payload = _pose_payload(HOME_POSITION)
     try:
         ui.send_message("home_updated", message={"home": payload})
     except Exception:
@@ -619,19 +647,12 @@ def set_home_current():
 def set_first_slot_current():
     """GET /api/set_first_slot_current: salva in RAM la posa corrente del primo slot."""
     global FIRST_SLOT_POSITION
-    current = {}
-    for sid in STS_SERVO_IDS:
-        pos = sts_read_pos(sid)
-        if pos is None:
-            return {"ok": False, "error": f"servo {sid} position unavailable"}
-        current[sid] = int(pos)
-
-    valid = _validated_home_position(current)
+    valid = _capture_current_pose()
     if not valid:
-        return {"ok": False, "error": "invalid first slot position"}
+        return {"ok": False, "error": "current servo pose unavailable or invalid"}
 
     FIRST_SLOT_POSITION = dict(valid)
-    payload = {str(k): int(v) for k, v in FIRST_SLOT_POSITION.items()}
+    payload = _pose_payload(FIRST_SLOT_POSITION)
     try:
         ui.send_message("first_slot_updated", message={"first_slot": payload})
     except Exception:
@@ -641,35 +662,26 @@ def set_first_slot_current():
 
 def go_to_home():
     """GET /api/go_home: move robot arm to persisted HOME_POSITION."""
-    global _idle_pause_until
-    _idle_pause_until = time.time() + IDLE_ANIM_PAUSE_AFTER_MANUAL_SEC
+    _pause_idle_temporarily()
     ok = _move_arm_to_pose(HOME_POSITION)
-    return {"ok": ok, "home": {str(k): int(v) for k, v in HOME_POSITION.items()}}
+    return {"ok": ok, "home": _pose_payload(HOME_POSITION)}
 
 
 def go_to_first_slot():
     """GET /api/go_first_slot: move robot arm to FIRST_SLOT_POSITION stored in RAM."""
-    global _idle_pause_until
     if not FIRST_SLOT_POSITION:
         return {"ok": False, "error": "first slot not saved yet"}
-    _idle_pause_until = time.time() + IDLE_ANIM_PAUSE_AFTER_MANUAL_SEC
+    _pause_idle_temporarily()
     ok = _move_arm_to_pose(FIRST_SLOT_POSITION)
-    return {"ok": ok, "first_slot": {str(k): int(v) for k, v in FIRST_SLOT_POSITION.items()}}
+    return {"ok": ok, "first_slot": _pose_payload(FIRST_SLOT_POSITION)}
 
 
 def grab_offset_config(step=None, direction=None):
     """GET /api/grab_offset_config?step=55&direction=1 (direction: 1 or -1)."""
     global GRAB_BASE_OFFSET_STEP, GRAB_BASE_OFFSET_DIRECTION
     try:
-        q_step = step
-        q_dir = direction
-        if q_step is None and q_dir is None:
-            try:
-                from flask import request
-                q_step = request.args.get("step")
-                q_dir = request.args.get("direction")
-            except Exception:
-                pass
+        q_step = _get_request_arg("step", step)
+        q_dir = _get_request_arg("direction", direction)
         if q_step is not None:
             q_step = int(q_step)
             if q_step < 0 or q_step > 500:
@@ -692,57 +704,11 @@ def grab_offset_config(step=None, direction=None):
         return {"ok": False, "error": str(e)}
 
 
-def _publish_telemetry_worker():
-    """Push realtime state, pressure and servo positions to WebUI via socket."""
-    last_state_ts = 0.0
-    last_state = None
-    last_log_ts = 0.0
-
-    while True:
-        now = time.time()
-
-        # State: push immediately on change + periodic heartbeat.
-        try:
-            state_now = _state_for_ui()
-            if state_now != last_state or (now - last_state_ts) >= TELEMETRY_STATE_HEARTBEAT_SEC:
-                ui.send_message("state", message={"state": state_now})
-                last_state = state_now
-                last_state_ts = now
-        except Exception:
-            pass
-
-        # Push cached telemetry every cycle (reader updates continuously).
-        try:
-            with _telemetry_lock:
-                p = dict(_telemetry_cache["pressure"])
-                pos = dict(_telemetry_cache["servo_positions"])
-            ui.send_message("pressure", message={"a0": p.get("a0"), "a1": p.get("a1")})
-            ui.send_message("servo_positions", message=pos)
-            if (now - last_log_ts) >= TELEMETRY_LOG_INTERVAL_SEC:
-                print(
-                    "[RT][publisher] "
-                    f"state={state_now} pressure=({p.get('a0')}, {p.get('a1')}) "
-                    f"servo={pos}"
-                )
-                last_log_ts = now
-        except Exception:
-            pass
-
-        time.sleep(TELEMETRY_PUSH_INTERVAL_SEC)
-
-
 def servo_move(id=None, position=None):
     """GET /api/servo_move?id=1&position=2048: muove il servo dato alla posizione (0–4095)."""
     try:
-        sid = id
-        pos = position
-        if sid is None or pos is None:
-            try:
-                from flask import request
-                sid = request.args.get("id")
-                pos = request.args.get("position")
-            except Exception:
-                pass
+        sid = _get_request_arg("id", id)
+        pos = _get_request_arg("position", position)
         if sid is None or pos is None:
             return {"ok": False, "error": "id and position required"}
         sid = int(sid)
@@ -753,8 +719,7 @@ def servo_move(id=None, position=None):
             return {"ok": False, "error": "position must be 0–4095"}
 
         # Piccola pausa dell'animazione idle, così il comando manuale non viene subito sovrascritto
-        global _idle_pause_until
-        _idle_pause_until = time.time() + IDLE_ANIM_PAUSE_AFTER_MANUAL_SEC
+        _pause_idle_temporarily()
 
         # Come nello script funzionante: speed e acc non zero (es. 1500, 50)
         ok = sts_move_pos(sid, pos, speed=1500, acc=50)
@@ -822,6 +787,19 @@ def sts_move_pos(servo_id: int, position: int, speed: int = 0, acc: int = 0) -> 
         return False
 
 
+def sts_set_torque(servo_id: int, enabled: bool) -> bool:
+    """Enable/disable torque on one STS3215 servo."""
+    try:
+        en = 1 if enabled else 0
+        res = _bridge_call_and_unwrap("sts_torque_enable", int(servo_id), int(en))
+        if res is None:
+            return False
+        return int(res) >= 0
+    except Exception as e:
+        print(f"[STS3215] torque error for id={servo_id}: {e}")
+        return False
+
+
 def led_matrix_available() -> bool:
     """True if matrix module is available on MCU side."""
     try:
@@ -849,7 +827,7 @@ def led_matrix_clear() -> bool:
 
 def led_matrix_set_state_name(state_name: str) -> bool:
     code_map = {
-        STATE_SETUP: 0,
+        STATE_SETUP: 3,
         STATE_DETECT: 0,
         STATE_GRAB: 1,
         STATE_RELEASE: 2,
@@ -927,10 +905,8 @@ except Exception:
 # Start workers after all symbols/functions are defined.
 threading.Thread(target=_state_machine_worker, daemon=True).start()
 threading.Thread(target=_idle_animation_worker, daemon=True).start()
-threading.Thread(target=_telemetry_reader_worker, daemon=True).start()
 
 # Check STS3215 all'avvio (dopo qualche secondo, così il Bridge è pronto)
 threading.Thread(target=_startup_sts_check, daemon=True).start()
-threading.Thread(target=_publish_telemetry_worker, daemon=True).start()
 
 App.run()
