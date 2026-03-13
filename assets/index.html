@@ -18,7 +18,7 @@ SPDX-License-Identifier: MPL-2.0
 
         <main class="main-content">
             <!-- Left: live preview with face detection (iframe shows stream with bounding boxes) -->
-            <section class="container video-section">
+            <section class="video-section">
                 <div id="videoFeedContainer" class="video-feed-container">
                     <div id="videoPlaceholder" class="camera-status">
                         <p class="feedback-text">Searching webcam…</p>
@@ -32,7 +32,13 @@ SPDX-License-Identifier: MPL-2.0
                 <div class="container container-right">
                     <div class="state-section">
                         <h2 class="section-title">State</h2>
-                        <div id="state-content" class="state-content">detect</div>
+                        <div id="state-content" class="state-content">Current: setup</div>
+                        <div class="state-timeline" id="stateTimeline">
+                            <button type="button" class="state-checkpoint" data-state="setup">Setup</button>
+                            <button type="button" class="state-checkpoint" data-state="detect">Detect</button>
+                            <button type="button" class="state-checkpoint" data-state="grab">Grab</button>
+                            <button type="button" class="state-checkpoint" data-state="release">Release</button>
+                        </div>
                     </div>
                 </div>
 
@@ -40,7 +46,7 @@ SPDX-License-Identifier: MPL-2.0
                     <div class="feedback-section">
                         <h2 class="section-title">Feedback</h2>
                         <div id="feedback-content" class="feedback-content">
-                            <p class="feedback-text">Watching camera. When a face is detected, state goes to grab → release → detect.</p>
+                            <p class="feedback-text">At boot, do setup (home + first slot). Then face detection runs grab → detect.</p>
                         </div>
                     </div>
                 </div>
@@ -70,6 +76,33 @@ SPDX-License-Identifier: MPL-2.0
                                 <span class="servo-value" id="servo4-value">—</span>
                                 <input type="range" id="servo4" class="servo-slider" min="0" max="4095" value="2048" aria-label="Servo 4">
                             </div>
+                        </div>
+                        <div class="servo-actions">
+                            <button id="setHomeButton" class="set-home-button" type="button">Set Home</button>
+                            <button id="setFirstSlotButton" class="set-home-button" type="button">Set First Slot</button>
+                            <button id="goHomeButton" class="set-home-button" type="button">Go To Home</button>
+                            <button id="goFirstSlotButton" class="set-home-button" type="button">Go To First Slot</button>
+                            <span id="setHomeStatus" class="set-home-status">Home corrente: non salvata</span>
+                            <span id="setFirstSlotStatus" class="set-home-status">First slot: non salvato</span>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="container container-right">
+                    <div class="matrix-section">
+                        <h2 class="section-title">LED Matrix</h2>
+                        <div class="matrix-row">
+                            <span class="matrix-label">Status</span>
+                            <span id="matrix-availability" class="matrix-value">unknown</span>
+                        </div>
+                        <div class="matrix-row">
+                            <label class="matrix-label" for="matrixIntensity">Brightness</label>
+                            <span id="matrix-intensity-value" class="matrix-value">3</span>
+                            <input type="range" id="matrixIntensity" min="0" max="15" value="3" class="servo-slider" aria-label="LED Matrix Brightness">
+                        </div>
+                        <div class="servo-actions">
+                            <button id="matrixClearButton" class="set-home-button" type="button">Clear Matrix</button>
+                            <span id="matrix-status" class="set-home-status">Ready</span>
                         </div>
                     </div>
                 </div>

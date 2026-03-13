@@ -1,6 +1,12 @@
 #include <Arduino_RouterBridge.h>
 #include <Servo.h>
 #include <SCServo.h>
+#if __has_include(<Modulino_LED_Matrix.h>)
+#include <Modulino_LED_Matrix.h>
+#define HAS_MODULINO_MATRIX 1
+#else
+#define HAS_MODULINO_MATRIX 0
+#endif
 
 #define SERVO_PIN 9
 #define PRESSURE_PIN_A0 A0
@@ -9,14 +15,20 @@
 Servo servo;
 SMS_STS sts;  // STS3215 serial bus controller
 
-// Called from Python (MPU) when a face is detected. Angle in degrees (0–180).
+#if HAS_MODULINO_MATRIX
+ModulinoLEDMatrix modulinoMatrix;
+bool modulino_matrix_ready = false;
+#endif
+int led_matrix_intensity = 3;  // 0..15, API compatibility
+
+// Called from Python when a face is detected. Angle in degrees (0-180).
 void move_servo(int angle) {
   if (angle < 0) angle = 0;
   if (angle > 180) angle = 180;
   servo.write(angle);
 }
 
-// Pressure sensors: analog read (0–1023). Exposed to Python via Bridge.
+// Pressure sensors: analog read (0-1023). Exposed via Bridge.
 int read_pressure_a0() {
   return analogRead(PRESSURE_PIN_A0);
 }
@@ -26,26 +38,89 @@ int read_pressure_a1() {
 }
 
 // ---- STS3215 servo bus (SCServo library) ----
-// NOTE: bus is wired to the UART used by `Serial` (D0/D1 on typical Arduino-style boards).
-// Python controls the arm by calling these functions via Bridge; all protocol details stay on the MCU.
-
 int sts_ping(int id) {
-  int res = sts.Ping((u8)id);
-  // SCServo Ping returns >=0 on success, <0 on error. We just forward the raw value.
-  return res;
+  return sts.Ping((u8)id);
 }
 
 int sts_read_pos(int id) {
-  // Returns raw position value from the servo or <0 on error.
-  int pos = sts.ReadPos((u8)id);
-  return pos;
+  return sts.ReadPos((u8)id);
 }
 
 int sts_move_pos(int id, int position, int speed, int acc) {
-  // High-level move command. Position is STS units (typically 0–4095 for 0–360°).
-  // Speed and acc are passed through directly.
-  int res = sts.WritePosEx((u8)id, (s16)position, (u16)speed, (u8)acc);
-  return res;
+  return sts.WritePosEx((u8)id, (s16)position, (u16)speed, (u8)acc);
+}
+
+// ---- Modulino LED Matrix over QWIIC ----
+int led_matrix_available() {
+#if HAS_MODULINO_MATRIX
+  return modulino_matrix_ready ? 1 : 0;
+#else
+  return 0;
+#endif
+}
+
+int led_matrix_set_intensity(int level) {
+#if HAS_MODULINO_MATRIX
+  if (level < 0) level = 0;
+  if (level > 15) level = 15;
+  led_matrix_intensity = level;
+  // ModulinoLEDMatrix does not expose a direct brightness API.
+  return 1;
+#else
+  (void)level;
+  return -1;
+#endif
+}
+
+int led_matrix_clear() {
+#if HAS_MODULINO_MATRIX
+  if (!modulino_matrix_ready) return -1;
+  modulinoMatrix.clear();
+  return 1;
+#else
+  return -1;
+#endif
+}
+
+#if HAS_MODULINO_MATRIX
+const uint32_t FRAME_DETECT[3] = {
+  0b00000000000000000000000000000000,
+  0b00001100000000000000000000110000,
+  0b00000000000000000000000000000000
+};
+const uint32_t FRAME_GRAB[3] = {
+  0b00000000011110000001111000000000,
+  0b00000000011110000001111000000000,
+  0b00000000011110000001111000000000
+};
+const uint32_t FRAME_RELEASE[3] = {
+  0b00000011111111111111111111000000,
+  0b00000011111111111111111111000000,
+  0b00000011111111111111111111000000
+};
+#endif
+
+int led_matrix_set_state(int state_code) {
+#if HAS_MODULINO_MATRIX
+  if (!modulino_matrix_ready) return -1;
+  // 0=detect, 1=grab, 2=release
+  if (state_code == 0) {
+    modulinoMatrix.loadFrame(FRAME_DETECT);
+    return 1;
+  }
+  if (state_code == 1) {
+    modulinoMatrix.loadFrame(FRAME_GRAB);
+    return 1;
+  }
+  if (state_code == 2) {
+    modulinoMatrix.loadFrame(FRAME_RELEASE);
+    return 1;
+  }
+  return 0;
+#else
+  (void)state_code;
+  return -1;
+#endif
 }
 
 void setup() {
@@ -55,9 +130,16 @@ void setup() {
   servo.attach(SERVO_PIN);
   servo.write(0);
 
-  // STS3215 serial bus sulla UART esposta come `Serial` dal core UNO Q
+  // STS3215 serial bus on Serial (UNO Q side)
   Serial.begin(1000000);
   sts.pSerial = &Serial;
+
+#if HAS_MODULINO_MATRIX
+  if (modulinoMatrix.begin()) {
+    modulino_matrix_ready = true;
+    modulinoMatrix.clear();
+  }
+#endif
 
   pinMode(PRESSURE_PIN_A0, INPUT);
   pinMode(PRESSURE_PIN_A1, INPUT);
@@ -65,12 +147,13 @@ void setup() {
   Bridge.provide_safe("move_servo", move_servo);
   Bridge.provide_safe("read_pressure_a0", read_pressure_a0);
   Bridge.provide_safe("read_pressure_a1", read_pressure_a1);
-
-  // STS3215 control endpoints exposed to Python
   Bridge.provide_safe("sts_ping", sts_ping);
   Bridge.provide_safe("sts_read_pos", sts_read_pos);
   Bridge.provide_safe("sts_move_pos", sts_move_pos);
+  Bridge.provide_safe("led_matrix_available", led_matrix_available);
+  Bridge.provide_safe("led_matrix_set_intensity", led_matrix_set_intensity);
+  Bridge.provide_safe("led_matrix_clear", led_matrix_clear);
+  Bridge.provide_safe("led_matrix_set_state", led_matrix_set_state);
 }
 
-void loop() {
-}
+void loop() {}

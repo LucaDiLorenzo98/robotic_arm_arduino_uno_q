@@ -8,6 +8,7 @@ from arduino.app_bricks.video_objectdetection import VideoObjectDetection
 from datetime import datetime, UTC
 import time
 import threading
+import math
 
 # ID dei servo STS3215 (solo 4 presenti sul bus)
 STS_SERVO_IDS = (1, 2, 3, 4)
@@ -15,17 +16,9 @@ STS_CHECK_IDS = STS_SERVO_IDS
 STS_STARTUP_DELAY_SEC = 3.0  # Attesa prima del check (Bridge deve essere pronto)
 
 
-def clear_console():
-    """Pulisce il terminale (ANSI, compatibile con UNO Q / Linux)."""
-    print("\033[2J\033[H", end="")
-    print("=" * 60)
-    print("RUN", datetime.now(UTC).isoformat())
-    print("=" * 60)
-
 
 def _print_sts_servo_info():
     """Stampa a console ping e posizione per ogni ID STS3215 (per check)."""
-    clear_console()
     print("[STS3215] Check servo (ping + posizione):\n")
     for sid in STS_CHECK_IDS:
         ok = sts_ping(sid)
@@ -40,12 +33,14 @@ def _startup_sts_check():
     """Esegue il check STS dopo un breve delay (Bridge deve essere connesso)."""
     time.sleep(STS_STARTUP_DELAY_SEC)
     try:
+        print("[SETUP] Move robot to HOME and keep still 5s, then FIRST_SLOT and keep still 5s.")
         _print_sts_servo_info()
     except Exception as e:
         print(f"[STS3215] startup check failed: {e}")
 
 
-# State machine: detect -> (face) -> grab -> release -> detect
+# State machine: setup -> detect -> (face) -> grab -> detect
+STATE_SETUP = "setup"
 STATE_DETECT = "detect"
 STATE_GRAB = "grab"
 STATE_RELEASE = "release"
@@ -58,11 +53,188 @@ GRAB_OPEN_WAIT_SEC = 1.0
 GRAB_CLOSE_WAIT_SEC = 1.0
 RELEASE_OPEN_WAIT_SEC = 3.0
 
-ui = WebUI()
-detection_stream = VideoObjectDetection(confidence=0.5, debounce_sec=0.0)
+# Posizione "home" del braccio STS3215 (RAM-only session).
+HOME_DEFAULT_POSITION = {
+    1: 2048,
+    2: 2048,
+    3: 2048,
+    4: 2048,
+}
+HOME_POSITION = dict(HOME_DEFAULT_POSITION)
+HOME_MOVE_SPEED = 1200
+HOME_MOVE_ACC = 40
+HOME_SETTLE_SEC = 1.2
 
-_state = STATE_DETECT
+# Primo slot (RAM-only session)
+FIRST_SLOT_POSITION: dict[int, int] = {}
+
+# Setup automatico: fermo per N secondi -> salva posizione.
+SETUP_STABLE_SECONDS = 5.0
+SETUP_MOVEMENT_THRESHOLD = 12
+SETUP_NOD_DELTA_SERVO4 = 120
+SETUP_NOD_SPEED = 500
+SETUP_NOD_ACC = 20
+SETUP_NOD_DELAY_SEC = 0.30
+
+# Grab sequenziale su 9 slot con offset base servo1 configurabile.
+GRAB_SLOT_COUNT_MAX = 9
+GRAB_BASE_SERVO_ID = 1
+GRAB_BASE_OFFSET_STEP = 55
+GRAB_BASE_OFFSET_DIRECTION = 1  # +1 o -1
+
+ui = WebUI()
+detection_stream = VideoObjectDetection(confidence=0.85, debounce_sec=0.0)
+
+_state = STATE_SETUP
 _state_lock = threading.Lock()
+_setup_phase = "home"  # home -> first_slot -> done
+_setup_prev_pose: dict[int, int] | None = None
+_setup_stable_since = 0.0
+_slot_grab_count = 0
+
+# Idle animation (STS3215) configuration
+IDLE_ANIM_ENABLED = True
+IDLE_ANIM_PERIOD_SEC = 10.0  # più dinamico ma ancora naturale
+IDLE_ANIM_CHECK_INTERVAL_SEC = 0.015
+IDLE_ANIM_AMPLITUDES = {
+    1: 210,
+    2: 170,
+    3: 140,
+    4: 110,
+}
+IDLE_ANIM_SPEED = 420
+IDLE_ANIM_ACC = 12
+IDLE_ANIM_MAX_STEP = 3   # passo ancora più piccolo = più fluido
+IDLE_ANIM_DEADBAND = 1   # aggiorna quasi continuo
+IDLE_ANIM_MIN_CMD_INTERVAL_SEC = 0.02
+IDLE_ANIM_FILTER_ALPHA = 0.08
+IDLE_ANIM_PAUSE_AFTER_MANUAL_SEC = 5.0
+
+# Push realtime UI telemetry (socket events)
+TELEMETRY_READER_INTERVAL_SEC = 0.10
+TELEMETRY_PUSH_INTERVAL_SEC = 0.10
+TELEMETRY_STATE_HEARTBEAT_SEC = 2.0
+TELEMETRY_LOG_INTERVAL_SEC = 2.0
+LED_MATRIX_DEFAULT_INTENSITY = 3
+
+_idle_base_pos: dict[int, int] = {}
+_idle_traj_state: dict[int, dict[str, float]] = {}
+_idle_lock = threading.Lock()
+_idle_pause_until = 0.0  # timestamp: finché > now, animazione sospesa (es. dopo comando manuale)
+_led_matrix_intensity = LED_MATRIX_DEFAULT_INTENSITY
+_telemetry_lock = threading.Lock()
+_telemetry_cache = {
+    "pressure": {"a0": None, "a1": None},
+    "servo_positions": {str(i): None for i in STS_SERVO_IDS},
+    "updated_at": 0.0,
+}
+
+
+def _validated_home_position(raw) -> dict[int, int]:
+    """Validate and normalize home dict from JSON-like data."""
+    out: dict[int, int] = {}
+    if not isinstance(raw, dict):
+        return {}
+    for sid in STS_SERVO_IDS:
+        val = raw.get(str(sid), raw.get(sid))
+        if val is None:
+            return {}
+        try:
+            v = int(val)
+        except Exception:
+            return {}
+        if not 0 <= v <= 4095:
+            return {}
+        out[sid] = v
+    return out
+
+
+def _set_home_from_current_pose():
+    """Set HOME_POSITION from current servo pose at startup (session RAM home)."""
+    global HOME_POSITION
+    current = {}
+    for sid in STS_SERVO_IDS:
+        pos = sts_read_pos(sid)
+        if pos is None:
+            return False
+        current[sid] = int(pos)
+    valid = _validated_home_position(current)
+    if not valid:
+        return False
+    HOME_POSITION = dict(valid)
+    print(f"[HOME] Startup home set from current pose: {HOME_POSITION}")
+    return True
+
+
+def _read_current_pose() -> dict[int, int] | None:
+    pose = {}
+    for sid in STS_SERVO_IDS:
+        pos = sts_read_pos(sid)
+        if pos is None:
+            return None
+        pose[sid] = int(pos)
+    valid = _validated_home_position(pose)
+    return valid if valid else None
+
+
+def _pose_has_movement(pose_a: dict[int, int], pose_b: dict[int, int], threshold: int) -> bool:
+    for sid in STS_SERVO_IDS:
+        if abs(int(pose_a.get(sid, 0)) - int(pose_b.get(sid, 0))) > threshold:
+            return True
+    return False
+
+
+def _setup_nod_servo4():
+    sid = 4
+    center = HOME_POSITION.get(sid)
+    if center is None:
+        return
+    left = max(0, min(4095, int(center - SETUP_NOD_DELTA_SERVO4)))
+    right = max(0, min(4095, int(center + SETUP_NOD_DELTA_SERVO4)))
+    sts_move_pos(sid, right, speed=SETUP_NOD_SPEED, acc=SETUP_NOD_ACC)
+    time.sleep(SETUP_NOD_DELAY_SEC)
+    sts_move_pos(sid, left, speed=SETUP_NOD_SPEED, acc=SETUP_NOD_ACC)
+    time.sleep(SETUP_NOD_DELAY_SEC)
+    sts_move_pos(sid, int(center), speed=SETUP_NOD_SPEED, acc=SETUP_NOD_ACC)
+    time.sleep(SETUP_NOD_DELAY_SEC)
+
+
+def _handle_setup_phase():
+    """Auto setup: hold still 5s to capture HOME, then FIRST_SLOT."""
+    global _setup_prev_pose, _setup_stable_since, _setup_phase, HOME_POSITION, FIRST_SLOT_POSITION, _slot_grab_count
+    now = time.time()
+    pose = _read_current_pose()
+    if pose is None:
+        return
+
+    if _setup_prev_pose is None:
+        _setup_prev_pose = dict(pose)
+        _setup_stable_since = now
+        return
+
+    moved = _pose_has_movement(pose, _setup_prev_pose, SETUP_MOVEMENT_THRESHOLD)
+    _setup_prev_pose = dict(pose)
+    if moved:
+        _setup_stable_since = now
+        return
+
+    if (now - _setup_stable_since) < SETUP_STABLE_SECONDS:
+        return
+
+    if _setup_phase == "home":
+        HOME_POSITION = dict(pose)
+        print(f"[SETUP] HOME captured: {HOME_POSITION}")
+        _setup_nod_servo4()
+        _setup_phase = "first_slot"
+        _setup_stable_since = now
+        return
+
+    if _setup_phase == "first_slot":
+        FIRST_SLOT_POSITION = dict(pose)
+        _slot_grab_count = 0
+        print(f"[SETUP] FIRST_SLOT captured: {FIRST_SLOT_POSITION}")
+        _setup_phase = "done"
+        _set_state(STATE_DETECT)
 
 
 def _set_state(new_state: str):
@@ -71,6 +243,10 @@ def _set_state(new_state: str):
         _state = new_state
     try:
         ui.send_message("state", message={"state": new_state})
+    except Exception:
+        pass
+    try:
+        led_matrix_set_state_name(new_state)
     except Exception:
         pass
     print(f"[StateMachine] -> {new_state}")
@@ -83,29 +259,214 @@ def _move_servo(angle: int):
         print(f"[StateMachine] move_servo({angle}) error: {e}")
 
 
+def _move_arm_to_home_position():
+    """Muove tutti i servo STS verso la home prima del ritorno a idle."""
+    for sid in STS_SERVO_IDS:
+        target = HOME_POSITION.get(sid)
+        if target is None:
+            continue
+        sts_move_pos(sid, int(target), speed=HOME_MOVE_SPEED, acc=HOME_MOVE_ACC)
+    time.sleep(HOME_SETTLE_SEC)
+
+
+def _move_arm_to_pose(target_pose: dict[int, int], speed: int = HOME_MOVE_SPEED, acc: int = HOME_MOVE_ACC) -> bool:
+    """Move all STS servos to a target pose dict {id: position}."""
+    ok_all = True
+    for sid in STS_SERVO_IDS:
+        target = target_pose.get(sid)
+        if target is None:
+            ok_all = False
+            continue
+        ok = sts_move_pos(sid, int(target), speed=int(speed), acc=int(acc))
+        ok_all = ok_all and ok
+    time.sleep(HOME_SETTLE_SEC)
+    return ok_all
+
+
 def _state_machine_worker():
     """Runs grab and release sequences with timed waits."""
-    global _state
+    global _state, _slot_grab_count
     while True:
-        time.sleep(0.2)
+        time.sleep(0.08)
         with _state_lock:
             s = _state
-        if s == STATE_GRAB:
+        if s == STATE_SETUP:
+            _handle_setup_phase()
+        elif s == STATE_GRAB:
             with _state_lock:
                 _state = "grab_running"
-            # Grab: open gripper, wait 1s, close, wait 1s, then release
+            if not FIRST_SLOT_POSITION:
+                print("[GRAB] First slot not configured yet.")
+                _set_state(STATE_SETUP)
+                continue
+
+            slot_idx = _slot_grab_count % GRAB_SLOT_COUNT_MAX
+            target_pose = dict(FIRST_SLOT_POSITION)
+            base_raw = int(target_pose.get(GRAB_BASE_SERVO_ID, 2048))
+            offset = int(GRAB_BASE_OFFSET_STEP) * int(slot_idx) * int(GRAB_BASE_OFFSET_DIRECTION)
+            target_pose[GRAB_BASE_SERVO_ID] = max(0, min(4095, base_raw + offset))
+
+            # Grab sequence: open -> go to first slot (+offset) -> close -> home
             _move_servo(GRIPPER_OPEN_ANGLE)
             time.sleep(GRAB_OPEN_WAIT_SEC)
+            _move_arm_to_pose(target_pose)
             _move_servo(GRIPPER_CLOSED_ANGLE)
             time.sleep(GRAB_CLOSE_WAIT_SEC)
-            _set_state(STATE_RELEASE)
+            _move_arm_to_home_position()
+            _slot_grab_count = (_slot_grab_count + 1) % GRAB_SLOT_COUNT_MAX
+            print(f"[GRAB] completed slot #{_slot_grab_count if _slot_grab_count > 0 else GRAB_SLOT_COUNT_MAX}")
+            _set_state(STATE_DETECT)
         elif s == STATE_RELEASE:
             with _state_lock:
                 _state = "release_running"
-            # Release: open gripper, wait 3s, back to detect
             _move_servo(GRIPPER_OPEN_ANGLE)
             time.sleep(RELEASE_OPEN_WAIT_SEC)
             _set_state(STATE_DETECT)
+
+
+# Home iniziale: verrà acquisita dalla posa corrente allo startup check.
+
+
+def _refresh_idle_base_positions():
+    """Aggiorna le posizioni di base per l'animazione idle, leggendo i servo attuali."""
+    global _idle_base_pos, _idle_traj_state
+    bases: dict[int, int] = {}
+    traj: dict[int, dict[str, float]] = {}
+    for sid in STS_SERVO_IDS:
+        pos = sts_read_pos(sid)
+        if pos is not None:
+            bases[sid] = pos
+            traj[sid] = {
+                "current": float(pos),
+                "last_sent": float(pos),
+                "phase": float((sid - 1) * (math.pi / 4.0)),
+                "last_cmd_ts": 0.0,
+            }
+    with _idle_lock:
+        _idle_base_pos = bases
+        _idle_traj_state = traj
+
+
+def _slew_towards(current: float, target: float, max_step: float) -> float:
+    """Move current toward target with bounded step for smooth trajectories."""
+    delta = target - current
+    if abs(delta) <= max_step:
+        return target
+    return current + (max_step if delta > 0 else -max_step)
+
+
+def _telemetry_reader_worker():
+    """Continuously read analog pressure + servo positions from MCU and cache them."""
+    last_log_ts = 0.0
+    while True:
+        now = time.time()
+
+        # Read analog pressure through Bridge.
+        a0 = None
+        a1 = None
+        try:
+            p0 = Bridge.call("read_pressure_a0")
+            p1 = Bridge.call("read_pressure_a1")
+            if hasattr(p0, "result"):
+                p0 = p0.result()
+            if hasattr(p1, "result"):
+                p1 = p1.result()
+            a0 = int(p0) if p0 is not None else None
+            a1 = int(p1) if p1 is not None else None
+        except Exception:
+            pass
+
+        # Read all STS positions continuously.
+        servo_positions = {}
+        for sid in STS_SERVO_IDS:
+            pos = sts_read_pos(sid)
+            servo_positions[str(sid)] = int(pos) if pos is not None else None
+
+        with _telemetry_lock:
+            if a0 is not None or a1 is not None:
+                _telemetry_cache["pressure"] = {"a0": a0, "a1": a1}
+            _telemetry_cache["servo_positions"] = servo_positions
+            _telemetry_cache["updated_at"] = now
+
+        if (now - last_log_ts) >= TELEMETRY_LOG_INTERVAL_SEC:
+            print(
+                "[RT][reader] "
+                f"pressure=({_telemetry_cache['pressure'].get('a0')}, {_telemetry_cache['pressure'].get('a1')}) "
+                f"servo={servo_positions}"
+            )
+            last_log_ts = now
+
+        time.sleep(TELEMETRY_READER_INTERVAL_SEC)
+
+
+def _idle_animation_worker():
+    """Animazione 'cerca qualcuno' quando il robot è in stato detect."""
+    global _idle_pause_until, _idle_traj_state
+    t0 = time.time()
+    last_state = None
+    while True:
+        time.sleep(IDLE_ANIM_CHECK_INTERVAL_SEC)
+        if not IDLE_ANIM_ENABLED:
+            continue
+
+        now = time.time()
+        if now < _idle_pause_until:
+            # Pausa temporanea (es. dopo un comando manuale dagli slider)
+            continue
+
+        with _state_lock:
+            s = _state
+
+        if s != STATE_DETECT:
+            last_state = s
+            continue
+
+        # Siamo entrati (o rientrati) nello stato detect: aggiorna le posizioni di base
+        if last_state != STATE_DETECT:
+            _refresh_idle_base_positions()
+        last_state = s
+
+        with _idle_lock:
+            bases = dict(_idle_base_pos)
+            traj = dict(_idle_traj_state)
+        if not bases:
+            continue
+
+        # Oscillazione morbida con slew-rate limit e deadband per evitare scatti.
+        t = now - t0
+        for sid, base in bases.items():
+            state = traj.get(sid)
+            if state is None:
+                continue
+            amp = IDLE_ANIM_AMPLITUDES.get(sid, 150)
+            phase = state.get("phase", 0.0)
+            wave = math.sin(2.0 * math.pi * t / IDLE_ANIM_PERIOD_SEC + phase)
+            desired = float(base) + float(amp) * wave
+            desired = max(0.0, min(4095.0, desired))
+
+            current = state.get("current", float(base))
+            filtered = current + float(IDLE_ANIM_FILTER_ALPHA) * (desired - current)
+            smoothed = _slew_towards(filtered, desired, float(IDLE_ANIM_MAX_STEP))
+            smoothed = max(0.0, min(4095.0, smoothed))
+
+            last_sent = state.get("last_sent", float(base))
+            last_cmd_ts = state.get("last_cmd_ts", 0.0)
+            can_send = (now - last_cmd_ts) >= float(IDLE_ANIM_MIN_CMD_INTERVAL_SEC)
+            if can_send and abs(smoothed - last_sent) >= float(IDLE_ANIM_DEADBAND):
+                target = int(round(smoothed))
+                ok = sts_move_pos(sid, target, speed=IDLE_ANIM_SPEED, acc=IDLE_ANIM_ACC)
+                if ok:
+                    state["last_sent"] = float(target)
+                    state["last_cmd_ts"] = now
+                else:
+                    # Se il comando fallisce, evitiamo di accumulare troppo errore.
+                    state["last_sent"] = smoothed
+
+            state["current"] = smoothed
+            traj[sid] = state
+
+        with _idle_lock:
+            _idle_traj_state = traj
 
 
 def face_detected():
@@ -116,60 +477,272 @@ def face_detected():
     _set_state(STATE_GRAB)
 
 
-# Start state machine worker thread
-_worker = threading.Thread(target=_state_machine_worker, daemon=True)
-_worker.start()
-
 ui.on_message("override_th", lambda sid, threshold: detection_stream.override_threshold(threshold))
 
 
 def get_pressure():
     """GET /api/pressure: return pressure sensor values from A0 and A1."""
-    try:
-        a0 = Bridge.call("read_pressure_a0")
-        a1 = Bridge.call("read_pressure_a1")
-        if hasattr(a0, "result"):
-            a0 = a0.result()
-        if hasattr(a1, "result"):
-            a1 = a1.result()
-        return {"a0": a0, "a1": a1}
-    except Exception as e:
-        print(f"[API] pressure error: {e}")
-        return {"a0": None, "a1": None, "error": str(e)}
+    with _telemetry_lock:
+        p = dict(_telemetry_cache["pressure"])
+    return {"a0": p.get("a0"), "a1": p.get("a1")}
+
+
+def _state_for_ui() -> str:
+    """Map internal machine state to user-facing state value."""
+    with _state_lock:
+        s = _state
+    if s in (STATE_SETUP, STATE_DETECT, STATE_GRAB, STATE_RELEASE):
+        return s
+    if s == "grab_running":
+        return STATE_GRAB
+    if s == "release_running":
+        return STATE_RELEASE
+    return STATE_DETECT
 
 
 def get_state():
     """GET /api/state: return current state machine state (detect / grab / release)."""
-    with _state_lock:
-        s = _state
-    if s in (STATE_DETECT, STATE_GRAB, STATE_RELEASE):
-        return {"state": s}
-    if s == "grab_running":
-        return {"state": STATE_GRAB}
-    if s == "release_running":
-        return {"state": STATE_RELEASE}
-    return {"state": STATE_DETECT}
+    return {"state": _state_for_ui()}
+
+
+def get_led_matrix_status():
+    """GET /api/led_matrix_status: availability + current intensity."""
+    return {
+        "available": led_matrix_available(),
+        "intensity": _led_matrix_intensity,
+    }
+
+
+def set_led_matrix_intensity(value=None):
+    """GET /api/led_matrix_intensity?value=0..15."""
+    global _led_matrix_intensity
+    try:
+        level = value
+        if level is None:
+            try:
+                from flask import request
+                level = request.args.get("value")
+            except Exception:
+                pass
+        if level is None:
+            return {"ok": False, "error": "value required"}
+        level = int(level)
+        if level < 0 or level > 15:
+            return {"ok": False, "error": "value must be 0..15"}
+        ok = led_matrix_set_intensity(level)
+        if ok:
+            _led_matrix_intensity = level
+        return {"ok": ok, "intensity": _led_matrix_intensity}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+def clear_led_matrix():
+    """GET /api/led_matrix_clear."""
+    try:
+        return {"ok": led_matrix_clear()}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+def _enter_setup_mode():
+    global _setup_phase, _setup_prev_pose, _setup_stable_since, FIRST_SLOT_POSITION, _slot_grab_count
+    _setup_phase = "home"
+    _setup_prev_pose = None
+    _setup_stable_since = time.time()
+    FIRST_SLOT_POSITION = {}
+    _slot_grab_count = 0
+    _set_state(STATE_SETUP)
+
+
+def set_state_checkpoint(state=None):
+    """GET /api/set_state?state=setup|detect|grab|release: force state machine checkpoint."""
+    try:
+        new_state = state
+        if new_state is None:
+            try:
+                from flask import request
+                new_state = request.args.get("state")
+            except Exception:
+                pass
+        if new_state is None:
+            return {"ok": False, "error": "state required"}
+        new_state = str(new_state).strip().lower()
+        if new_state not in (STATE_SETUP, STATE_DETECT, STATE_GRAB, STATE_RELEASE):
+            return {"ok": False, "error": "state must be setup|detect|grab|release"}
+        if new_state == STATE_SETUP:
+            _enter_setup_mode()
+            return {"ok": True, "state": STATE_SETUP}
+        _set_state(new_state)
+        return {"ok": True, "state": new_state}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
 
 ui.expose_api("GET", "/api/pressure", get_pressure)
 ui.expose_api("GET", "/api/state", get_state)
+ui.expose_api("GET", "/api/led_matrix_status", get_led_matrix_status)
+ui.expose_api("GET", "/api/led_matrix_intensity", set_led_matrix_intensity)
+ui.expose_api("GET", "/api/led_matrix_clear", clear_led_matrix)
+ui.expose_api("GET", "/api/set_state", set_state_checkpoint)
 
 
 def get_servo_positions():
     """GET /api/servo_positions: posizioni attuali dei 4 servo STS3215 (per inizializzare gli slider)."""
-    out = {}
+    with _telemetry_lock:
+        return dict(_telemetry_cache["servo_positions"])
+
+
+def set_home_current():
+    """GET /api/set_home_current: salva la posizione attuale dei servo come home (RAM)."""
+    global HOME_POSITION
+    current = {}
     for sid in STS_SERVO_IDS:
         pos = sts_read_pos(sid)
-        out[str(sid)] = pos if pos is not None else None
-    return out
+        if pos is None:
+            return {"ok": False, "error": f"servo {sid} position unavailable"}
+        current[sid] = int(pos)
+
+    valid = _validated_home_position(current)
+    if not valid:
+        return {"ok": False, "error": "invalid current home position"}
+
+    HOME_POSITION = dict(valid)
+    payload = {str(k): int(v) for k, v in HOME_POSITION.items()}
+    try:
+        ui.send_message("home_updated", message={"home": payload})
+    except Exception:
+        pass
+    return {"ok": True, "home": payload}
 
 
-def servo_move():
+def set_first_slot_current():
+    """GET /api/set_first_slot_current: salva in RAM la posa corrente del primo slot."""
+    global FIRST_SLOT_POSITION
+    current = {}
+    for sid in STS_SERVO_IDS:
+        pos = sts_read_pos(sid)
+        if pos is None:
+            return {"ok": False, "error": f"servo {sid} position unavailable"}
+        current[sid] = int(pos)
+
+    valid = _validated_home_position(current)
+    if not valid:
+        return {"ok": False, "error": "invalid first slot position"}
+
+    FIRST_SLOT_POSITION = dict(valid)
+    payload = {str(k): int(v) for k, v in FIRST_SLOT_POSITION.items()}
+    try:
+        ui.send_message("first_slot_updated", message={"first_slot": payload})
+    except Exception:
+        pass
+    return {"ok": True, "first_slot": payload}
+
+
+def go_to_home():
+    """GET /api/go_home: move robot arm to persisted HOME_POSITION."""
+    global _idle_pause_until
+    _idle_pause_until = time.time() + IDLE_ANIM_PAUSE_AFTER_MANUAL_SEC
+    ok = _move_arm_to_pose(HOME_POSITION)
+    return {"ok": ok, "home": {str(k): int(v) for k, v in HOME_POSITION.items()}}
+
+
+def go_to_first_slot():
+    """GET /api/go_first_slot: move robot arm to FIRST_SLOT_POSITION stored in RAM."""
+    global _idle_pause_until
+    if not FIRST_SLOT_POSITION:
+        return {"ok": False, "error": "first slot not saved yet"}
+    _idle_pause_until = time.time() + IDLE_ANIM_PAUSE_AFTER_MANUAL_SEC
+    ok = _move_arm_to_pose(FIRST_SLOT_POSITION)
+    return {"ok": ok, "first_slot": {str(k): int(v) for k, v in FIRST_SLOT_POSITION.items()}}
+
+
+def grab_offset_config(step=None, direction=None):
+    """GET /api/grab_offset_config?step=55&direction=1 (direction: 1 or -1)."""
+    global GRAB_BASE_OFFSET_STEP, GRAB_BASE_OFFSET_DIRECTION
+    try:
+        q_step = step
+        q_dir = direction
+        if q_step is None and q_dir is None:
+            try:
+                from flask import request
+                q_step = request.args.get("step")
+                q_dir = request.args.get("direction")
+            except Exception:
+                pass
+        if q_step is not None:
+            q_step = int(q_step)
+            if q_step < 0 or q_step > 500:
+                return {"ok": False, "error": "step must be 0..500"}
+            GRAB_BASE_OFFSET_STEP = q_step
+        if q_dir is not None:
+            q_dir = int(q_dir)
+            if q_dir not in (-1, 1):
+                return {"ok": False, "error": "direction must be -1 or 1"}
+            GRAB_BASE_OFFSET_DIRECTION = q_dir
+
+        return {
+            "ok": True,
+            "step": int(GRAB_BASE_OFFSET_STEP),
+            "direction": int(GRAB_BASE_OFFSET_DIRECTION),
+            "slot_count": int(_slot_grab_count),
+            "slot_max": int(GRAB_SLOT_COUNT_MAX),
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+def _publish_telemetry_worker():
+    """Push realtime state, pressure and servo positions to WebUI via socket."""
+    last_state_ts = 0.0
+    last_state = None
+    last_log_ts = 0.0
+
+    while True:
+        now = time.time()
+
+        # State: push immediately on change + periodic heartbeat.
+        try:
+            state_now = _state_for_ui()
+            if state_now != last_state or (now - last_state_ts) >= TELEMETRY_STATE_HEARTBEAT_SEC:
+                ui.send_message("state", message={"state": state_now})
+                last_state = state_now
+                last_state_ts = now
+        except Exception:
+            pass
+
+        # Push cached telemetry every cycle (reader updates continuously).
+        try:
+            with _telemetry_lock:
+                p = dict(_telemetry_cache["pressure"])
+                pos = dict(_telemetry_cache["servo_positions"])
+            ui.send_message("pressure", message={"a0": p.get("a0"), "a1": p.get("a1")})
+            ui.send_message("servo_positions", message=pos)
+            if (now - last_log_ts) >= TELEMETRY_LOG_INTERVAL_SEC:
+                print(
+                    "[RT][publisher] "
+                    f"state={state_now} pressure=({p.get('a0')}, {p.get('a1')}) "
+                    f"servo={pos}"
+                )
+                last_log_ts = now
+        except Exception:
+            pass
+
+        time.sleep(TELEMETRY_PUSH_INTERVAL_SEC)
+
+
+def servo_move(id=None, position=None):
     """GET /api/servo_move?id=1&position=2048: muove il servo dato alla posizione (0–4095)."""
     try:
-        from flask import request
-        sid = request.args.get("id")
-        pos = request.args.get("position")
+        sid = id
+        pos = position
+        if sid is None or pos is None:
+            try:
+                from flask import request
+                sid = request.args.get("id")
+                pos = request.args.get("position")
+            except Exception:
+                pass
         if sid is None or pos is None:
             return {"ok": False, "error": "id and position required"}
         sid = int(sid)
@@ -178,7 +751,13 @@ def servo_move():
             return {"ok": False, "error": f"id must be in {list(STS_SERVO_IDS)}"}
         if not 0 <= pos <= 4095:
             return {"ok": False, "error": "position must be 0–4095"}
-        ok = sts_move_pos(sid, pos)
+
+        # Piccola pausa dell'animazione idle, così il comando manuale non viene subito sovrascritto
+        global _idle_pause_until
+        _idle_pause_until = time.time() + IDLE_ANIM_PAUSE_AFTER_MANUAL_SEC
+
+        # Come nello script funzionante: speed e acc non zero (es. 1500, 50)
+        ok = sts_move_pos(sid, pos, speed=1500, acc=50)
         return {"ok": ok}
     except Exception as e:
         return {"ok": False, "error": str(e)}
@@ -186,6 +765,11 @@ def servo_move():
 
 ui.expose_api("GET", "/api/servo_positions", get_servo_positions)
 ui.expose_api("GET", "/api/servo_move", servo_move)
+ui.expose_api("GET", "/api/set_home_current", set_home_current)
+ui.expose_api("GET", "/api/set_first_slot_current", set_first_slot_current)
+ui.expose_api("GET", "/api/go_home", go_to_home)
+ui.expose_api("GET", "/api/go_first_slot", go_to_first_slot)
+ui.expose_api("GET", "/api/grab_offset_config", grab_offset_config)
 
 
 def _bridge_call_and_unwrap(method: str, *args):
@@ -237,6 +821,48 @@ def sts_move_pos(servo_id: int, position: int, speed: int = 0, acc: int = 0) -> 
         print(f"[STS3215] move_pos error for id={servo_id}: {e}")
         return False
 
+
+def led_matrix_available() -> bool:
+    """True if matrix module is available on MCU side."""
+    try:
+        res = _bridge_call_and_unwrap("led_matrix_available")
+        return res is not None and int(res) > 0
+    except Exception:
+        return False
+
+
+def led_matrix_set_intensity(level: int) -> bool:
+    try:
+        res = _bridge_call_and_unwrap("led_matrix_set_intensity", int(level))
+        return res is not None and int(res) > 0
+    except Exception:
+        return False
+
+
+def led_matrix_clear() -> bool:
+    try:
+        res = _bridge_call_and_unwrap("led_matrix_clear")
+        return res is not None and int(res) > 0
+    except Exception:
+        return False
+
+
+def led_matrix_set_state_name(state_name: str) -> bool:
+    code_map = {
+        STATE_SETUP: 0,
+        STATE_DETECT: 0,
+        STATE_GRAB: 1,
+        STATE_RELEASE: 2,
+    }
+    code = code_map.get(str(state_name).lower())
+    if code is None:
+        return False
+    try:
+        res = _bridge_call_and_unwrap("led_matrix_set_state", int(code))
+        return res is not None and int(res) > 0
+    except Exception:
+        return False
+
 # Support both "face" and "Face" (model may use either)
 detection_stream.on_detect("face", face_detected)
 try:
@@ -285,13 +911,26 @@ def send_detections_to_ui(detections: dict):
             }
             ui.send_message("detection", message=entry)
         # Move servo when we see a face (in case on_detect used different label)
-        if key.lower() == "face" and items and items[0][1] >= 0.5:
+        if key.lower() == "face" and items and items[0][1] >= 0.85:
             face_detected()
 
 
 detection_stream.on_detect_all(send_detections_to_ui)
 
+# Initialize LED matrix (if present) with default state.
+try:
+    led_matrix_set_intensity(_led_matrix_intensity)
+    led_matrix_set_state_name(STATE_SETUP)
+except Exception:
+    pass
+
+# Start workers after all symbols/functions are defined.
+threading.Thread(target=_state_machine_worker, daemon=True).start()
+threading.Thread(target=_idle_animation_worker, daemon=True).start()
+threading.Thread(target=_telemetry_reader_worker, daemon=True).start()
+
 # Check STS3215 all'avvio (dopo qualche secondo, così il Bridge è pronto)
 threading.Thread(target=_startup_sts_check, daemon=True).start()
+threading.Thread(target=_publish_telemetry_worker, daemon=True).start()
 
 App.run()
