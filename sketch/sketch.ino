@@ -2,11 +2,12 @@
 #include <Wire.h>
 #include <Servo.h>
 #include <SCServo.h>
+#include <Arduino_LED_Matrix.h>
 #if __has_include(<Modulino.h>)
 #include <Modulino.h>
 #define HAS_MODULINO_CORE 1
 #elif __has_include(<Arduino_Modulino.h>)
-c
+#include <Arduino_Modulino.h>
 #define HAS_MODULINO_CORE 1
 #else
 #define HAS_MODULINO_CORE 0
@@ -18,6 +19,9 @@ c
 
 Servo servo;
 SMS_STS sts;  // STS3215 serial bus controller
+
+Arduino_LED_Matrix coreMatrix;
+bool core_matrix_ready = false;
 
 #if HAS_MODULINO_CORE
 ModulinoPixels modulinoPixels;
@@ -82,7 +86,7 @@ int sts_torque_enable(int id, int enable) {
 
 int led_matrix_available() {
 #if HAS_MODULINO_CORE
-  return modulino_pixels_ready ? 1 : 0;
+  return (modulino_pixels_ready || core_matrix_ready) ? 1 : 0;
 #else
   return 0;
 #endif
@@ -150,6 +154,223 @@ static void _matrix_draw_release(int b) {
   }
 }
 
+static void _linear_draw_setup(int b) {
+  for (int i = 0; i < 8; i += 2) modulinoPixels.set(i, BLUE, b);
+}
+
+static void _linear_draw_detect(int b) {
+  modulinoPixels.set(2, BLUE, b);
+  modulinoPixels.set(5, BLUE, b);
+}
+
+static void _linear_draw_grab(int b) {
+  for (int i = 0; i < 8; i++) modulinoPixels.set(i, RED, b);
+}
+
+static void _linear_draw_release(int b) {
+  for (int i = 0; i < 8; i++) modulinoPixels.set(i, GREEN, b);
+}
+
+// ---- On-board UNO Q 8x13 LED matrix (Arduino_LED_Matrix) ----
+
+// Simple letter shapes (S/D/G/R) + setup step numbers 1/2/3.
+
+// S1
+uint8_t CORE_SETUP1_LOGO[104] = {
+  0,0,0,0,0,0,0,0,0,0,0,0,0,
+  0,0,1,1,1,0,0,0,0,0,0,0,0,
+  0,0,1,0,0,0,0,0,1,0,0,0,0,
+  0,0,1,1,1,0,0,0,1,0,0,0,0,
+  0,0,0,0,1,0,0,0,1,0,0,0,0,
+  0,0,1,1,1,0,0,0,1,0,0,0,0,
+  0,0,0,0,0,0,0,0,0,0,0,0,0,
+  0,0,0,0,0,0,0,0,0,0,0,0,0
+};
+
+// S2
+uint8_t CORE_SETUP2_LOGO[104] = {
+  0,0,0,0,0,0,0,0,0,0,0,0,0,
+  0,0,1,1,1,0,0,0,0,0,0,0,0,
+  0,0,1,0,0,0,0,0,1,0,0,0,0,
+  0,0,1,1,1,0,0,0,1,1,0,0,0,
+  0,0,1,0,0,0,0,0,1,0,1,0,0,
+  0,0,1,1,1,0,0,0,1,1,1,0,0,
+  0,0,0,0,0,0,0,0,0,0,0,0,0,
+  0,0,0,0,0,0,0,0,0,0,0,0,0
+};
+
+// S3
+uint8_t CORE_SETUP3_LOGO[104] = {
+  0,0,0,0,0,0,0,0,0,0,0,0,0,
+  0,0,1,1,1,0,0,0,0,0,0,0,0,
+  0,0,1,0,0,0,0,0,1,0,1,0,0,
+  0,0,1,1,1,0,0,0,0,1,0,0,0,
+  0,0,1,0,0,0,0,0,0,1,0,0,0,
+  0,0,1,1,1,0,0,0,1,0,1,0,0,
+  0,0,0,0,0,0,0,0,0,0,0,0,0,
+  0,0,0,0,0,0,0,0,0,0,0,0,0
+};
+
+// D
+uint8_t CORE_DETECT_LOGO[104] = {
+  0,0,0,0,0,0,0,0,0,0,0,0,0,
+  0,0,1,1,0,0,0,0,0,0,0,0,0,
+  0,0,1,0,1,0,0,0,0,0,0,0,0,
+  0,0,1,0,0,1,0,0,0,0,0,0,0,
+  0,0,1,0,0,1,0,0,0,0,0,0,0,
+  0,0,1,0,1,0,0,0,0,0,0,0,0,
+  0,0,1,1,0,0,0,0,0,0,0,0,0,
+  0,0,0,0,0,0,0,0,0,0,0,0,0
+};
+
+// G
+uint8_t CORE_GRAB_LOGO[104] = {
+  0,0,0,0,0,0,0,0,0,0,0,0,0,
+  0,0,0,1,1,0,0,0,0,0,0,0,0,
+  0,0,1,0,0,1,0,0,0,0,0,0,0,
+  0,0,1,0,0,0,0,0,0,0,0,0,0,
+  0,0,1,0,1,1,0,0,0,0,0,0,0,
+  0,0,1,0,0,1,0,0,0,0,0,0,0,
+  0,0,0,1,1,0,0,0,0,0,0,0,0,
+  0,0,0,0,0,0,0,0,0,0,0,0,0
+};
+
+// R
+uint8_t CORE_RELEASE_LOGO[104] = {
+  0,0,0,0,0,0,0,0,0,0,0,0,0,
+  0,0,1,1,1,0,0,0,0,0,0,0,0,
+  0,0,1,0,0,1,0,0,0,0,0,0,0,
+  0,0,1,0,0,1,0,0,0,0,0,0,0,
+  0,0,1,1,1,0,0,0,0,0,0,0,0,
+  0,0,1,0,1,0,0,0,0,0,0,0,0,
+  0,0,1,0,0,1,0,0,0,0,0,0,0,
+  0,0,0,0,0,0,0,0,0,0,0,0,0
+};
+
+// Error base pattern "ER" on the left, room for small digit on the right.
+uint8_t CORE_ERROR1_LOGO[104] = {
+  // ER1
+  0,0,0,0,0,0,0,0,0,0,0,0,0,
+  0,1,1,1,0,0,1,0,0,0,0,1,0,
+  0,1,0,0,0,0,1,0,0,0,1,1,0,
+  0,1,1,1,0,0,1,0,0,0,0,1,0,
+  0,1,0,0,0,0,1,0,0,0,0,1,0,
+  0,1,1,1,0,0,1,0,0,0,0,1,0,
+  0,0,0,0,0,0,0,0,0,0,0,0,0,
+  0,0,0,0,0,0,0,0,0,0,0,0,0
+};
+
+uint8_t CORE_ERROR2_LOGO[104] = {
+  // ER2
+  0,0,0,0,0,0,0,0,0,0,0,0,0,
+  0,1,1,1,0,0,1,0,0,0,1,1,0,
+  0,1,0,0,0,0,1,0,0,1,0,1,0,
+  0,1,1,1,0,0,1,0,0,0,1,1,0,
+  0,1,0,0,0,0,1,0,0,1,0,0,0,
+  0,1,1,1,0,0,1,0,0,1,1,1,0,
+  0,0,0,0,0,0,0,0,0,0,0,0,0,
+  0,0,0,0,0,0,0,0,0,0,0,0,0
+};
+
+uint8_t CORE_ERROR3_LOGO[104] = {
+  // ER3
+  0,0,0,0,0,0,0,0,0,0,0,0,0,
+  0,1,1,1,0,0,1,0,0,0,1,1,0,
+  0,1,0,0,0,0,1,0,0,0,0,1,0,
+  0,1,1,1,0,0,1,0,0,0,1,1,0,
+  0,1,0,0,0,0,1,0,0,0,0,1,0,
+  0,1,1,1,0,0,1,0,0,0,1,1,0,
+  0,0,0,0,0,0,0,0,0,0,0,0,0,
+  0,0,0,0,0,0,0,0,0,0,0,0,0
+};
+
+uint8_t CORE_ERROR4_LOGO[104] = {
+  // ER4
+  0,0,0,0,0,0,0,0,0,0,0,0,0,
+  0,1,1,1,0,0,1,0,0,1,0,1,0,
+  0,1,0,0,0,0,1,0,0,1,0,1,0,
+  0,1,1,1,0,0,1,0,0,1,1,1,0,
+  0,1,0,0,0,0,1,0,0,0,0,1,0,
+  0,1,1,1,0,0,1,0,0,0,0,1,0,
+  0,0,0,0,0,0,0,0,0,0,0,0,0,
+  0,0,0,0,0,0,0,0,0,0,0,0,0
+};
+
+uint8_t CORE_ERROR5_LOGO[104] = {
+  // ER5
+  0,0,0,0,0,0,0,0,0,0,0,0,0,
+  0,1,1,1,0,0,1,0,0,1,1,1,0,
+  0,1,0,0,0,0,1,0,0,1,0,0,0,
+  0,1,1,1,0,0,1,0,0,1,1,1,0,
+  0,1,0,0,0,0,1,0,0,0,0,1,0,
+  0,1,1,1,0,0,1,0,0,1,1,1,0,
+  0,0,0,0,0,0,0,0,0,0,0,0,0,
+  0,0,0,0,0,0,0,0,0,0,0,0,0
+};
+
+void _core_matrix_set_state(int state_code) {
+  if (!core_matrix_ready) return;
+  if (state_code == 0) {
+    coreMatrix.draw(CORE_DETECT_LOGO);
+    return;
+  }
+  if (state_code == 1) {
+    coreMatrix.draw(CORE_GRAB_LOGO);
+    return;
+  }
+  if (state_code == 2) {
+    coreMatrix.draw(CORE_RELEASE_LOGO);
+    return;
+  }
+  if (state_code == 3) {
+    // Generic setup (if phase not specified).
+    coreMatrix.draw(CORE_SETUP1_LOGO);
+    return;
+  }
+}
+
+int core_matrix_set_setup_step(int step) {
+  if (!core_matrix_ready) return -1;
+  if (step == 1) {
+    coreMatrix.draw(CORE_SETUP1_LOGO);
+    return 1;
+  }
+  if (step == 2) {
+    coreMatrix.draw(CORE_SETUP2_LOGO);
+    return 1;
+  }
+  if (step == 3) {
+    coreMatrix.draw(CORE_SETUP3_LOGO);
+    return 1;
+  }
+  return 0;
+}
+
+int core_matrix_set_error_code(int code) {
+  if (!core_matrix_ready) return -1;
+  if (code == 1) {
+    coreMatrix.draw(CORE_ERROR1_LOGO);
+    return 1;
+  }
+  if (code == 2) {
+    coreMatrix.draw(CORE_ERROR2_LOGO);
+    return 1;
+  }
+  if (code == 3) {
+    coreMatrix.draw(CORE_ERROR3_LOGO);
+    return 1;
+  }
+  if (code == 4) {
+    coreMatrix.draw(CORE_ERROR4_LOGO);
+    return 1;
+  }
+  if (code == 5) {
+    coreMatrix.draw(CORE_ERROR5_LOGO);
+    return 1;
+  }
+  return 0;
+}
+
 int led_matrix_set_intensity(int level) {
 #if HAS_MODULINO_CORE
   if (level < 0) level = 0;
@@ -173,37 +394,45 @@ int led_matrix_clear() {
 }
 
 int led_matrix_set_state(int state_code) {
-#if HAS_MODULINO_CORE
-  if (!modulino_pixels_ready) return -1;
-  int b = _pixels_brightness();
-  modulinoPixels.clear();
+  // Always update on-board matrix if available.
+  _core_matrix_set_state(state_code);
 
-  // 0=detect, 1=grab, 2=release, 3=setup
-  if (state_code == 0) {
-    _matrix_draw_detect(b);
+#if HAS_MODULINO_CORE
+  if (modulino_pixels_ready) {
+    int b = _pixels_brightness();
+    modulinoPixels.clear();
+
+    // 0=detect, 1=grab, 2=release, 3=setup
+    if (state_code == 0) {
+      _linear_draw_detect(b);   // fallback for 8-led mapping
+      _matrix_draw_detect(b);
+      modulinoPixels.show();
+      return 1;
+    }
+    if (state_code == 1) {
+      _linear_draw_grab(b);     // fallback for 8-led mapping
+      _matrix_draw_grab(b);
+      modulinoPixels.show();
+      return 1;
+    }
+    if (state_code == 2) {
+      _linear_draw_release(b);  // fallback for 8-led mapping
+      _matrix_draw_release(b);
+      modulinoPixels.show();
+      return 1;
+    }
+    if (state_code == 3) {
+      _linear_draw_setup(b);    // fallback for 8-led mapping
+      _matrix_draw_setup(b);
+      modulinoPixels.show();
+      return 1;
+    }
     modulinoPixels.show();
-    return 1;
   }
-  if (state_code == 1) {
-    _matrix_draw_grab(b);
-    modulinoPixels.show();
-    return 1;
-  }
-  if (state_code == 2) {
-    _matrix_draw_release(b);
-    modulinoPixels.show();
-    return 1;
-  }
-  if (state_code == 3) {
-    _matrix_draw_setup(b);
-    modulinoPixels.show();
-    return 1;
-  }
-  modulinoPixels.show();
   return 0;
 #else
   (void)state_code;
-  return -1;
+  return core_matrix_ready ? 1 : -1;
 #endif
 }
 
@@ -218,6 +447,11 @@ void setup() {
   Serial.begin(1000000);
   sts.pSerial = &Serial;
 
+  // On-board LED matrix
+  coreMatrix.begin();
+  coreMatrix.setGrayscaleBits(1);
+  core_matrix_ready = true;
+  _core_matrix_set_state(3);  // setup state at boot
 #if HAS_MODULINO_CORE
   Wire.begin();
   Modulino.begin();
@@ -242,6 +476,8 @@ void setup() {
   Bridge.provide_safe("led_matrix_set_intensity", led_matrix_set_intensity);
   Bridge.provide_safe("led_matrix_clear", led_matrix_clear);
   Bridge.provide_safe("led_matrix_set_state", led_matrix_set_state);
+  Bridge.provide_safe("core_matrix_set_setup_step", core_matrix_set_setup_step);
+  Bridge.provide_safe("core_matrix_set_error_code", core_matrix_set_error_code);
 }
 
 void loop() {}

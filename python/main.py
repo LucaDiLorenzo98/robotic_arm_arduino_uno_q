@@ -35,9 +35,13 @@ def _startup_sts_check():
     try:
         print("[SETUP] Move robot to HOME, then hold still 5s.")
         print("[SETUP] Then move robot to FIRST_SLOT, then hold still 5s.")
+        print("[SETUP] Then move robot to SECOND_SLOT, then hold still 5s.")
         _set_gripper_idle_closed_free()
         _print_sts_servo_info()
-        print(f"[MATRIX] available={led_matrix_available()}")
+        m_ok = led_matrix_available()
+        print(f"[MATRIX] available={m_ok}")
+        if not m_ok:
+            core_matrix_set_error_code(ERR_MATRIX_UNAVAILABLE)
     except Exception as e:
         print(f"[STS3215] startup check failed: {e}")
 
@@ -51,11 +55,16 @@ STATE_RELEASE = "release"
 # Gripper servo angles (adjust if your servo is reversed)
 GRIPPER_OPEN_ANGLE = 0
 GRIPPER_CLOSED_ANGLE = 90
-GRIPPER_GRAB_PREOPEN_ANGLE = 25  # "open a little" before slot approach
+GRIPPER_GRAB_PREOPEN_ANGLE = 12  # open just a little before slot approach
 
 GRAB_OPEN_WAIT_SEC = 1.0
 GRAB_CLOSE_WAIT_SEC = 1.0
 GRAB_WAIT_BEFORE_HOME_SEC = 15.0
+GRAB_SETTLE_BEFORE_CLOSE_SEC = 2.0
+GRAB_APPROACH_SPEED = 700
+GRAB_APPROACH_ACC = 20
+GRAB_RETURN_SPEED = 800
+GRAB_RETURN_ACC = 25
 RELEASE_OPEN_WAIT_SEC = 3.0
 
 # Posizione "home" del braccio STS3215 (RAM-only session).
@@ -66,12 +75,14 @@ HOME_DEFAULT_POSITION = {
     4: 2048,
 }
 HOME_POSITION = dict(HOME_DEFAULT_POSITION)
-HOME_MOVE_SPEED = 1200
-HOME_MOVE_ACC = 40
+HOME_MOVE_SPEED = 900
+HOME_MOVE_ACC = 30
 HOME_SETTLE_SEC = 1.2
 
 # Primo slot (RAM-only session)
 FIRST_SLOT_POSITION: dict[int, int] = {}
+# Secondo slot (RAM-only session): usato per calcolare offset tra slot.
+SECOND_SLOT_POSITION: dict[int, int] = {}
 
 # Setup automatico: fermo per N secondi -> salva posizione.
 SETUP_STABLE_SECONDS = 5.0
@@ -92,7 +103,7 @@ detection_stream = VideoObjectDetection(confidence=0.85, debounce_sec=0.0)
 
 _state = STATE_SETUP
 _state_lock = threading.Lock()
-_setup_phase = "home"  # home -> first_slot -> done
+_setup_phase = "home"  # home -> first_slot -> second_slot -> done
 _setup_prev_pose: dict[int, int] | None = None
 _setup_stable_since = 0.0
 _setup_phase_moved = False  # diventa True quando rileva movimento manuale nella fase corrente
@@ -116,6 +127,8 @@ IDLE_ANIM_DEADBAND = 1   # aggiorna quasi continuo
 IDLE_ANIM_MIN_CMD_INTERVAL_SEC = 0.02
 IDLE_ANIM_FILTER_ALPHA = 0.08
 IDLE_ANIM_PAUSE_AFTER_MANUAL_SEC = 5.0
+IDLE_ANIM_ACTIVE_WINDOW_SEC = 10.0
+IDLE_ANIM_REST_WINDOW_SEC = 30.0
 
 # Push realtime UI telemetry (socket events)
 TELEMETRY_READER_INTERVAL_SEC = 0.10
@@ -123,6 +136,13 @@ TELEMETRY_PUSH_INTERVAL_SEC = 0.10
 TELEMETRY_STATE_HEARTBEAT_SEC = 2.0
 TELEMETRY_LOG_INTERVAL_SEC = 2.0
 LED_MATRIX_DEFAULT_INTENSITY = 3
+
+# Error codes for core matrix 'ERx' display.
+ERR_SETUP_POSE_UNAVAILABLE = 1
+ERR_GRAB_SLOT_NOT_CONFIGURED = 2
+ERR_STS_MOVE_FAILED = 3
+ERR_MATRIX_UNAVAILABLE = 4
+ERR_PRESSURE_READ_FAILED = 5
 
 _idle_base_pos: dict[int, int] = {}
 _idle_traj_state: dict[int, dict[str, float]] = {}
@@ -229,14 +249,17 @@ def _setup_nod_servo4():
 
 
 def _handle_setup_phase():
-    """Auto setup: hold still 5s to capture HOME, then FIRST_SLOT."""
-    global _setup_prev_pose, _setup_stable_since, _setup_phase, _setup_phase_moved, _setup_torque_free_active, HOME_POSITION, FIRST_SLOT_POSITION, _slot_grab_count
+    """Auto setup: hold still 5s to capture HOME, FIRST_SLOT, SECOND_SLOT."""
+    global _setup_prev_pose, _setup_stable_since, _setup_phase, _setup_phase_moved, _setup_torque_free_active
+    global HOME_POSITION, FIRST_SLOT_POSITION, SECOND_SLOT_POSITION, _slot_grab_count
+    global GRAB_BASE_OFFSET_STEP, GRAB_BASE_OFFSET_DIRECTION
     now = time.time()
     if not _setup_torque_free_active:
         _set_sts_torque_enabled(False)
         _setup_torque_free_active = True
     pose = _read_current_pose()
     if pose is None:
+        core_matrix_set_error_code(ERR_SETUP_POSE_UNAVAILABLE)
         return
 
     if _setup_prev_pose is None:
@@ -273,18 +296,43 @@ def _handle_setup_phase():
         _setup_phase_moved = False
         _setup_prev_pose = None
         _setup_stable_since = now
+        core_matrix_set_setup_step(1)
         return
 
     if _setup_phase == "first_slot":
         FIRST_SLOT_POSITION = dict(pose)
-        _slot_grab_count = 0
         print(f"[SETUP] FIRST_SLOT captured: {FIRST_SLOT_POSITION}")
+        _setup_phase = "second_slot"
+        _setup_phase_moved = False
+        _setup_prev_pose = None
+        _setup_stable_since = now
+        core_matrix_set_setup_step(2)
+        return
+
+    if _setup_phase == "second_slot":
+        SECOND_SLOT_POSITION = dict(pose)
+        print(f"[SETUP] SECOND_SLOT captured: {SECOND_SLOT_POSITION}")
+
+        # Auto-calc offset from FIRST_SLOT -> SECOND_SLOT on base servo.
+        first_base = int(FIRST_SLOT_POSITION.get(GRAB_BASE_SERVO_ID, 0))
+        second_base = int(SECOND_SLOT_POSITION.get(GRAB_BASE_SERVO_ID, first_base))
+        delta = second_base - first_base
+        if delta != 0:
+            GRAB_BASE_OFFSET_DIRECTION = 1 if delta > 0 else -1
+            GRAB_BASE_OFFSET_STEP = abs(delta)
+        print(
+            "[SETUP] slot offset updated: "
+            f"step={GRAB_BASE_OFFSET_STEP}, direction={GRAB_BASE_OFFSET_DIRECTION}, delta={delta}"
+        )
+
+        _slot_grab_count = 0
         _setup_phase = "done"
         _setup_phase_moved = False
         _set_sts_torque_enabled(True)
         _setup_torque_free_active = False
         print("[SETUP] Returning to HOME before idle.")
         _move_arm_to_home_position()
+        core_matrix_set_setup_step(3)
         _set_state(STATE_DETECT)
 
 
@@ -369,6 +417,7 @@ def _state_machine_worker():
                 _state = "grab_running"
             if not FIRST_SLOT_POSITION:
                 print("[GRAB] First slot not configured yet.")
+                core_matrix_set_error_code(ERR_GRAB_SLOT_NOT_CONFIGURED)
                 _set_state(STATE_SETUP)
                 continue
 
@@ -378,18 +427,19 @@ def _state_machine_worker():
             offset = int(GRAB_BASE_OFFSET_STEP) * int(slot_idx) * int(GRAB_BASE_OFFSET_DIRECTION)
             target_pose[GRAB_BASE_SERVO_ID] = max(0, min(4095, base_raw + offset))
 
-            # Grab sequence: small open -> go to slot (+offset) -> close max -> wait -> home (closed)
+            # Grab sequence: small open -> slow approach -> settle -> close max -> slow return home (closed)
             _set_gripper_hold(True)
             _move_servo(GRIPPER_GRAB_PREOPEN_ANGLE)
             time.sleep(GRAB_OPEN_WAIT_SEC)
-            _move_arm_to_pose(target_pose)
+            _move_arm_to_pose(target_pose, speed=GRAB_APPROACH_SPEED, acc=GRAB_APPROACH_ACC)
+            time.sleep(GRAB_SETTLE_BEFORE_CLOSE_SEC)
             p_open = get_pressure()
             print(f"[GRAB][PRESSURE][open] A0={p_open.get('a0')} A1={p_open.get('a1')}")
             _move_servo(GRIPPER_CLOSED_ANGLE)
             time.sleep(GRAB_CLOSE_WAIT_SEC)
             p_closed = get_pressure()
             print(f"[GRAB][PRESSURE][after_pick] A0={p_closed.get('a0')} A1={p_closed.get('a1')}")
-            _move_arm_to_home_position()
+            _move_arm_to_pose(HOME_POSITION, speed=GRAB_RETURN_SPEED, acc=GRAB_RETURN_ACC)
             # Keep object clamped until we are back at HOME, then wait user pickup time.
             time.sleep(GRAB_WAIT_BEFORE_HOME_SEC)
             _move_servo(GRIPPER_OPEN_ANGLE)
@@ -443,6 +493,8 @@ def _idle_animation_worker():
     global _idle_pause_until, _idle_traj_state
     t0 = time.time()
     last_state = None
+    detect_cycle_start_ts = 0.0
+    rest_home_done = False
     while True:
         time.sleep(IDLE_ANIM_CHECK_INTERVAL_SEC)
         if not IDLE_ANIM_ENABLED:
@@ -464,7 +516,23 @@ def _idle_animation_worker():
         if last_state != STATE_DETECT:
             _set_gripper_idle_closed_free()
             _refresh_idle_base_positions()
+            detect_cycle_start_ts = now
+            rest_home_done = False
         last_state = s
+
+        # Idle duty cycle: 10s animation + 30s home rest (repeat).
+        cycle_len = float(IDLE_ANIM_ACTIVE_WINDOW_SEC + IDLE_ANIM_REST_WINDOW_SEC)
+        elapsed = now - detect_cycle_start_ts
+        if cycle_len > 0.0 and elapsed >= cycle_len:
+            detect_cycle_start_ts = now
+            elapsed = 0.0
+            rest_home_done = False
+
+        if elapsed >= float(IDLE_ANIM_ACTIVE_WINDOW_SEC):
+            if not rest_home_done:
+                _move_arm_to_home_position()
+                rest_home_done = True
+            continue
 
         with _idle_lock:
             bases = dict(_idle_base_pos)
@@ -530,6 +598,7 @@ def get_pressure():
             "a1": int(a1) if a1 is not None else None,
         }
     except Exception:
+        core_matrix_set_error_code(ERR_PRESSURE_READ_FAILED)
         return {"a0": None, "a1": None}
 
 
@@ -586,7 +655,8 @@ def clear_led_matrix():
 
 
 def _enter_setup_mode():
-    global _setup_phase, _setup_prev_pose, _setup_stable_since, _setup_phase_moved, _setup_torque_free_active, FIRST_SLOT_POSITION, _slot_grab_count
+    global _setup_phase, _setup_prev_pose, _setup_stable_since, _setup_phase_moved, _setup_torque_free_active
+    global FIRST_SLOT_POSITION, SECOND_SLOT_POSITION, _slot_grab_count
     _setup_phase = "home"
     _setup_prev_pose = None
     _setup_stable_since = time.time()
@@ -594,8 +664,10 @@ def _enter_setup_mode():
     _set_sts_torque_enabled(False)
     _setup_torque_free_active = True
     FIRST_SLOT_POSITION = {}
+    SECOND_SLOT_POSITION = {}
     _slot_grab_count = 0
     _set_state(STATE_SETUP)
+    core_matrix_set_setup_step(1)
 
 
 def set_state_checkpoint(state=None):
@@ -766,6 +838,26 @@ def sts_ping(servo_id: int) -> bool:
         return False
 
 
+def core_matrix_set_setup_step(step: int) -> bool:
+    """Show setup step S1/S2/S3 on UNO Q onboard matrix."""
+    try:
+        res = _bridge_call_and_unwrap("core_matrix_set_setup_step", int(step))
+        return res is not None and int(res) > 0
+    except Exception as e:
+        print(f"[MATRIX] core_matrix_set_setup_step({step}) error: {e}")
+        return False
+
+
+def core_matrix_set_error_code(code: int) -> bool:
+    """Show error 'ER' + numeric code on UNO Q onboard matrix."""
+    try:
+        res = _bridge_call_and_unwrap("core_matrix_set_error_code", int(code))
+        return res is not None and int(res) > 0
+    except Exception as e:
+        print(f"[MATRIX] core_matrix_set_error_code({code}) error: {e}")
+        return False
+
+
 def sts_read_pos(servo_id: int) -> int | None:
     """Read raw position from STS3215 (or None on error)."""
     try:
@@ -789,6 +881,7 @@ def sts_move_pos(servo_id: int, position: int, speed: int = 0, acc: int = 0) -> 
         return int(res) >= 0
     except Exception as e:
         print(f"[STS3215] move_pos error for id={servo_id}: {e}")
+        core_matrix_set_error_code(ERR_STS_MOVE_FAILED)
         return False
 
 
