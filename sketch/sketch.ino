@@ -3,6 +3,14 @@
 #include <Servo.h>
 #include <SCServo.h>
 #include <Arduino_LED_Matrix.h>
+#ifdef endTextAnimation
+#undef endTextAnimation
+#endif
+#ifdef beginTextAnimation
+#undef beginTextAnimation
+#endif
+#include <ArduinoGraphics.h>
+#include "Modulino_LED_Matrix.h"
 #if __has_include(<Modulino.h>)
 #include <Modulino.h>
 #define HAS_MODULINO_CORE 1
@@ -23,11 +31,134 @@ SMS_STS sts;  // STS3215 serial bus controller
 Arduino_LED_Matrix coreMatrix;
 bool core_matrix_ready = false;
 
-#if HAS_MODULINO_CORE
-ModulinoPixels modulinoPixels;
-bool modulino_pixels_ready = false;
-#endif
 int led_matrix_intensity = 3;  // 0..15, API compatibility
+
+// Head matrix (Modulino LED Matrix). Logical coordinates: x=0..11, y=0..7.
+ModulinoLEDMatrix headMatrix;
+bool head_matrix_ready = false;
+volatile int head_state_code = 3; // 0=detect,1=grab,2=release,3=setup
+unsigned long head_last_blink_ms = 0;
+bool head_blink_closed = false;
+unsigned long head_last_tick_ms = 0;
+int head_last_render_state = -1;
+bool head_last_render_blink = false;
+
+static inline int _clamp_i(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
+
+// Head matrix orientation mapping.
+static void _head_point(int x, int y) {
+  // No rotation (direct mapping). If still rotated, we can switch to 90° mapping.
+  x = _clamp_i(x, 0, 11);
+  y = _clamp_i(y, 0, 7);
+  headMatrix.point(x, y);
+}
+
+static void _head_rect(int x, int y, int w, int h) {
+  for (int yy = y; yy < (y + h); yy++) {
+    for (int xx = x; xx < (x + w); xx++) {
+      _head_point(xx, yy);
+    }
+  }
+}
+
+static void _head_clear_draw() {
+  headMatrix.clear();
+  headMatrix.beginDraw();
+  headMatrix.stroke(0xFFFFFF);
+  headMatrix.fill(0xFFFFFF);
+}
+
+static void _head_end_draw() { headMatrix.endDraw(); }
+
+static void _head_capsule_filled(int x, int y, int w, int h) {
+  // Draw a filled vertical capsule using pixel math (rect + 2 semicircles).
+  if (w < 1 || h < 1) return;
+  int r = w / 2;
+  if (r < 1) r = 1;
+  int cx = x + (w - 1) / 2;
+  int cy_top = y + r;
+  int cy_bot = y + h - 1 - r;
+  for (int yy = y; yy < (y + h); yy++) {
+    for (int xx = x; xx < (x + w); xx++) {
+      bool inside = false;
+      if (yy >= (y + r) && yy <= (y + h - 1 - r)) {
+        inside = true; // middle rectangle
+      } else if (yy < (y + r)) {
+        int dx = xx - cx;
+        int dy = yy - cy_top;
+        inside = (dx * dx + dy * dy) <= (r * r);
+      } else {
+        int dx = xx - cx;
+        int dy = yy - cy_bot;
+        inside = (dx * dx + dy * dy) <= (r * r);
+      }
+      if (inside) _head_point(xx, yy);
+    }
+  }
+}
+
+static void _head_draw_eyes_open() {
+  // Vertical capsule eyes (filled)
+  _head_capsule_filled(2, 1, 3, 6);
+  _head_capsule_filled(7, 1, 3, 6);
+}
+
+static void _head_draw_eyes_blink() {
+  // Thin blink line
+  _head_rect(2, 4, 3, 1);
+  _head_rect(7, 4, 3, 1);
+}
+
+static void _head_draw_eyes_grab() {
+  // Focused eyes: same capsules
+  _head_capsule_filled(2, 1, 3, 6);
+  _head_capsule_filled(7, 1, 3, 6);
+}
+
+static void _head_draw_eyes_release() {
+  // Happy eyes: bigger capsules
+  _head_capsule_filled(1, 1, 4, 6);
+  _head_capsule_filled(7, 1, 4, 6);
+}
+
+static void _head_render_state(int state_code, bool blink_closed) {
+  if (!head_matrix_ready) return;
+  _head_clear_draw();
+  if (state_code == 0) { // detect
+    if (blink_closed) _head_draw_eyes_blink();
+    else _head_draw_eyes_open();
+  } else if (state_code == 1) { // grab
+    _head_draw_eyes_grab();
+  } else if (state_code == 2) { // release
+    _head_draw_eyes_release();
+  } else { // setup
+    _head_draw_eyes_open();
+    // No extra indicator pixels (avoid "stuck" top-right LED)
+  }
+  _head_end_draw();
+}
+
+static void _head_tick() {
+  if (!head_matrix_ready) return;
+  unsigned long now = millis();
+  if (now - head_last_tick_ms < 60) return;
+  head_last_tick_ms = now;
+
+  if (head_state_code == 0 || head_state_code == 3) {
+    if (now - head_last_blink_ms > 3500) {
+      head_blink_closed = true;
+      head_last_blink_ms = now;
+    }
+    if (head_blink_closed && (now - head_last_blink_ms > 160)) {
+      head_blink_closed = false;
+    }
+    if (head_last_render_state != head_state_code || head_last_render_blink != head_blink_closed) {
+      _head_render_state(head_state_code, head_blink_closed);
+      head_last_render_state = head_state_code;
+      head_last_render_blink = head_blink_closed;
+    }
+  }
+}
 
 // Called from Python when a face is detected. Angle in degrees (0-180).
 void move_servo(int angle) {
@@ -79,96 +210,8 @@ int sts_torque_enable(int id, int enable) {
   return sts.EnableTorque((u8)id, en);
 }
 
-// ---- Modulino Pixels over QWIIC (treated as 8x13 matrix) ----
-#define MATRIX_H 8
-#define MATRIX_W 13
-#define MATRIX_PIXELS (MATRIX_H * MATRIX_W)
-
 int led_matrix_available() {
-#if HAS_MODULINO_CORE
-  return (modulino_pixels_ready || core_matrix_ready) ? 1 : 0;
-#else
-  return 0;
-#endif
-}
-
-static int _pixels_brightness() {
-  int level = led_matrix_intensity;
-  if (level < 0) level = 0;
-  if (level > 15) level = 15;
-  // Modulino examples use brightness 0..100.
-  return (level * 100) / 15;
-}
-
-static int _matrix_index(int x, int y) {
-  if (x < 0 || x >= MATRIX_W || y < 0 || y >= MATRIX_H) return -1;
-  // Serpentine mapping row-by-row:
-  // even row: left->right, odd row: right->left
-  if ((y & 1) == 0) {
-    return (y * MATRIX_W) + x;
-  }
-  return (y * MATRIX_W) + (MATRIX_W - 1 - x);
-}
-
-static void _matrix_set_xy(int x, int y, ModulinoColor color, int brightness) {
-  int idx = _matrix_index(x, y);
-  if (idx < 0) return;
-  modulinoPixels.set(idx, color, brightness);
-}
-
-static void _matrix_clear_show() {
-  modulinoPixels.clear();
-  modulinoPixels.show();
-}
-
-static void _matrix_draw_setup(int b) {
-  // Center block 3x3
-  for (int y = 2; y <= 4; y++) {
-    for (int x = 5; x <= 7; x++) {
-      _matrix_set_xy(x, y, BLUE, b);
-    }
-  }
-}
-
-static void _matrix_draw_detect(int b) {
-  // Two eyes
-  _matrix_set_xy(4, 2, BLUE, b);
-  _matrix_set_xy(8, 2, BLUE, b);
-}
-
-static void _matrix_draw_grab(int b) {
-  // Red horizontal bar
-  for (int x = 2; x <= 10; x++) {
-    _matrix_set_xy(x, 3, RED, b);
-    _matrix_set_xy(x, 4, RED, b);
-  }
-}
-
-static void _matrix_draw_release(int b) {
-  // Green X
-  for (int i = 0; i < 8; i++) {
-    int x1 = 2 + i;
-    int x2 = 10 - i;
-    if (x1 >= 0 && x1 < MATRIX_W) _matrix_set_xy(x1, i, GREEN, b);
-    if (x2 >= 0 && x2 < MATRIX_W) _matrix_set_xy(x2, i, GREEN, b);
-  }
-}
-
-static void _linear_draw_setup(int b) {
-  for (int i = 0; i < 8; i += 2) modulinoPixels.set(i, BLUE, b);
-}
-
-static void _linear_draw_detect(int b) {
-  modulinoPixels.set(2, BLUE, b);
-  modulinoPixels.set(5, BLUE, b);
-}
-
-static void _linear_draw_grab(int b) {
-  for (int i = 0; i < 8; i++) modulinoPixels.set(i, RED, b);
-}
-
-static void _linear_draw_release(int b) {
-  for (int i = 0; i < 8; i++) modulinoPixels.set(i, GREEN, b);
+  return (head_matrix_ready || core_matrix_ready) ? 1 : 0;
 }
 
 // ---- On-board UNO Q 8x13 LED matrix (Arduino_LED_Matrix) ----
@@ -372,68 +415,33 @@ int core_matrix_set_error_code(int code) {
 }
 
 int led_matrix_set_intensity(int level) {
-#if HAS_MODULINO_CORE
+  // Head matrix (ModulinoLEDMatrix) does not expose a brightness API in this project.
+  // We still implement intensity for the UNO Q onboard coreMatrix so the UI slider
+  // actually affects hardware.
   if (level < 0) level = 0;
   if (level > 15) level = 15;
   led_matrix_intensity = level;
+  if (core_matrix_ready) {
+    coreMatrix.setIntensity((uint8_t)level);
+  }
   return 1;
-#else
-  (void)level;
-  return -1;
-#endif
 }
 
 int led_matrix_clear() {
-#if HAS_MODULINO_CORE
-  if (!modulino_pixels_ready) return -1;
-  _matrix_clear_show();
+  if (!head_matrix_ready) return -1;
+  headMatrix.clear();
   return 1;
-#else
-  return -1;
-#endif
 }
 
 int led_matrix_set_state(int state_code) {
   // Always update on-board matrix if available.
   _core_matrix_set_state(state_code);
 
-#if HAS_MODULINO_CORE
-  if (modulino_pixels_ready) {
-    int b = _pixels_brightness();
-    modulinoPixels.clear();
-
-    // 0=detect, 1=grab, 2=release, 3=setup
-    if (state_code == 0) {
-      _linear_draw_detect(b);   // fallback for 8-led mapping
-      _matrix_draw_detect(b);
-      modulinoPixels.show();
-      return 1;
-    }
-    if (state_code == 1) {
-      _linear_draw_grab(b);     // fallback for 8-led mapping
-      _matrix_draw_grab(b);
-      modulinoPixels.show();
-      return 1;
-    }
-    if (state_code == 2) {
-      _linear_draw_release(b);  // fallback for 8-led mapping
-      _matrix_draw_release(b);
-      modulinoPixels.show();
-      return 1;
-    }
-    if (state_code == 3) {
-      _linear_draw_setup(b);    // fallback for 8-led mapping
-      _matrix_draw_setup(b);
-      modulinoPixels.show();
-      return 1;
-    }
-    modulinoPixels.show();
-  }
-  return 0;
-#else
-  (void)state_code;
-  return core_matrix_ready ? 1 : -1;
-#endif
+  head_state_code = state_code;
+  _head_render_state(state_code, false);
+  head_last_render_state = state_code;
+  head_last_render_blink = false;
+  return (head_matrix_ready || core_matrix_ready) ? 1 : -1;
 }
 
 void setup() {
@@ -452,14 +460,18 @@ void setup() {
   coreMatrix.setGrayscaleBits(1);
   core_matrix_ready = true;
   _core_matrix_set_state(3);  // setup state at boot
+
+  // Head LED matrix (Modulino LED Matrix)
 #if HAS_MODULINO_CORE
-  Wire.begin();
   Modulino.begin();
-  delay(50);
-  modulinoPixels.begin();
-  modulino_pixels_ready = true;
-  led_matrix_set_state(3);
 #endif
+  delay(50);
+  if (headMatrix.begin()) {
+    head_matrix_ready = true;
+    _head_render_state(3, false);
+  } else {
+    head_matrix_ready = false;
+  }
 
   pinMode(PRESSURE_PIN_A0, INPUT);
   pinMode(PRESSURE_PIN_A1, INPUT);
@@ -480,4 +492,8 @@ void setup() {
   Bridge.provide_safe("core_matrix_set_error_code", core_matrix_set_error_code);
 }
 
-void loop() {}
+void loop() {
+  _head_tick();
+  // Yield to let RouterBridge and other tasks run reliably on Zephyr.
+  delay(2);
+}

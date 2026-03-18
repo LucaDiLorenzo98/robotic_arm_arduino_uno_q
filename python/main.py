@@ -9,11 +9,86 @@ from datetime import datetime, UTC
 import time
 import threading
 import math
+import os
+import sys
+from functools import partial
+
+
+def _enable_unbuffered_console_and_file_log() -> None:
+    """
+    Best-effort: make prints visible in real time.
+    Some launchers capture/buffer stdout; this forces flushing and also mirrors
+    stdout/stderr to a local log file for debugging.
+    """
+
+    # 1) Force line-buffering (when supported) so lines appear immediately.
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except Exception:
+        pass
+    try:
+        sys.stderr.reconfigure(line_buffering=True)
+    except Exception:
+        pass
+
+    # 2) Mirror stdout/stderr to a file in this project (useful when console is muted).
+    log_path = os.environ.get("ROBOT_LOG_PATH") or os.path.join(
+        os.path.dirname(__file__), "robot.log"
+    )
+    try:
+        log_f = open(log_path, "a", encoding="utf-8", buffering=1)
+    except Exception:
+        return
+
+    class _Tee:
+        def __init__(self, a, b):
+            self._a = a
+            self._b = b
+
+        def write(self, s):
+            try:
+                self._a.write(s)
+            except Exception:
+                pass
+            try:
+                self._b.write(s)
+            except Exception:
+                pass
+            return len(s)
+
+        def flush(self):
+            try:
+                self._a.flush()
+            except Exception:
+                pass
+            try:
+                self._b.flush()
+            except Exception:
+                pass
+
+        def isatty(self):
+            try:
+                return bool(getattr(self._a, "isatty")())
+            except Exception:
+                return False
+
+    sys.stdout = _Tee(sys.stdout, log_f)
+    sys.stderr = _Tee(sys.stderr, log_f)
+
+
+_enable_unbuffered_console_and_file_log()
+
+# Ensure every print flushes by default (helps with buffered stdout).
+print = partial(print, flush=True)
 
 # ID dei servo STS3215 (solo 4 presenti sul bus)
 STS_SERVO_IDS = (1, 2, 3, 4)
 STS_CHECK_IDS = STS_SERVO_IDS
-STS_STARTUP_DELAY_SEC = 3.0  # Attesa prima del check (Bridge deve essere pronto)
+STS_STARTUP_DELAY_SEC = 6.0  # Attesa prima del check (Bridge/MCU/servo bus devono essere pronti)
+
+# Bridge calls can time out during early startup or transient USB/serial hiccups.
+BRIDGE_CALL_RETRIES = 3
+BRIDGE_CALL_RETRY_DELAY_SEC = 0.25
 
 
 
@@ -33,15 +108,18 @@ def _startup_sts_check():
     """Esegue il check STS dopo un breve delay (Bridge deve essere connesso)."""
     time.sleep(STS_STARTUP_DELAY_SEC)
     try:
+        # Clear indication: now it's safe to start setup and move the robot by hand.
+        core_matrix_set_setup_step(1)
         print("[SETUP] Move robot to HOME, then hold still 5s.")
         print("[SETUP] Then move robot to FIRST_SLOT, then hold still 5s.")
         print("[SETUP] Then move robot to SECOND_SLOT, then hold still 5s.")
-        _set_gripper_idle_closed_free()
+        # Ready for setup: nod + open gripper slightly
+        _set_sts_torque_enabled(True)
+        _setup_nod_servo4()
+        _set_sts_torque_enabled(False)
+        _set_gripper_setup_open_free()
         _print_sts_servo_info()
-        m_ok = led_matrix_available()
-        print(f"[MATRIX] available={m_ok}")
-        if not m_ok:
-            core_matrix_set_error_code(ERR_MATRIX_UNAVAILABLE)
+        print("[SETUP] READY: you can move the arm now.")
     except Exception as e:
         print(f"[STS3215] startup check failed: {e}")
 
@@ -56,6 +134,7 @@ STATE_RELEASE = "release"
 GRIPPER_OPEN_ANGLE = 0
 GRIPPER_CLOSED_ANGLE = 90
 GRIPPER_GRAB_PREOPEN_ANGLE = 12  # open just a little before slot approach
+GRIPPER_SETUP_OPEN_ANGLE = 12  # slightly open during setup
 
 GRAB_OPEN_WAIT_SEC = 1.0
 GRAB_CLOSE_WAIT_SEC = 1.0
@@ -66,6 +145,12 @@ GRAB_APPROACH_ACC = 20
 GRAB_RETURN_SPEED = 800
 GRAB_RETURN_ACC = 25
 RELEASE_OPEN_WAIT_SEC = 3.0
+
+# Delivery pose (RAM-only). If not set, computed as HOME + DELIVERY_DELTAS (no base rotation).
+DELIVERY_POSITION: dict[int, int] = {}
+DELIVERY_DELTAS = {2: 120, 3: -120, 4: 0}
+DELIVERY_SPEED = 650
+DELIVERY_ACC = 18
 
 # Posizione "home" del braccio STS3215 (RAM-only session).
 HOME_DEFAULT_POSITION = {
@@ -108,7 +193,9 @@ _setup_prev_pose: dict[int, int] | None = None
 _setup_stable_since = 0.0
 _setup_phase_moved = False  # diventa True quando rileva movimento manuale nella fase corrente
 _setup_torque_free_active = False
+_setup_pose_fail_streak = 0
 _slot_grab_count = 0
+_grab_offset_warn_ts = 0.0
 
 # Idle animation (STS3215) configuration
 IDLE_ANIM_ENABLED = True
@@ -141,13 +228,16 @@ LED_MATRIX_DEFAULT_INTENSITY = 3
 ERR_SETUP_POSE_UNAVAILABLE = 1
 ERR_GRAB_SLOT_NOT_CONFIGURED = 2
 ERR_STS_MOVE_FAILED = 3
-ERR_MATRIX_UNAVAILABLE = 4
+ERR_MATRIX_UNAVAILABLE = 4  # deprecated (no longer shown at boot)
 ERR_PRESSURE_READ_FAILED = 5
 
 _idle_base_pos: dict[int, int] = {}
 _idle_traj_state: dict[int, dict[str, float]] = {}
 _idle_lock = threading.Lock()
 _idle_pause_until = 0.0  # timestamp: finché > now, animazione sospesa (es. dopo comando manuale)
+
+# Bridge calls are not thread-safe: serialize all calls with a single lock.
+_bridge_lock = threading.Lock()
 _led_matrix_intensity = LED_MATRIX_DEFAULT_INTENSITY
 def _validated_home_position(raw) -> dict[int, int]:
     """Validate and normalize home dict from JSON-like data."""
@@ -181,14 +271,23 @@ def _get_request_arg(name: str, fallback=None):
 
 def _capture_current_pose() -> dict[int, int] | None:
     """Read current pose for all configured STS servos and validate it."""
-    current = {}
-    for sid in STS_SERVO_IDS:
-        pos = sts_read_pos(sid)
-        if pos is None:
-            return None
-        current[sid] = int(pos)
-    valid = _validated_home_position(current)
-    return valid if valid else None
+    # STS reads can fail transiently (return None or negative). Retry briefly
+    # to avoid aborting setup on a single bad read.
+    for _ in range(3):
+        current: dict[int, int] = {}
+        ok = True
+        for sid in STS_SERVO_IDS:
+            pos = sts_read_pos(sid)
+            if pos is None:
+                ok = False
+                break
+            current[sid] = int(pos)
+        if ok:
+            valid = _validated_home_position(current)
+            if valid:
+                return valid
+        time.sleep(0.03)
+    return None
 
 
 def _pose_payload(pose: dict[int, int]) -> dict[str, int]:
@@ -251,6 +350,7 @@ def _setup_nod_servo4():
 def _handle_setup_phase():
     """Auto setup: hold still 5s to capture HOME, FIRST_SLOT, SECOND_SLOT."""
     global _setup_prev_pose, _setup_stable_since, _setup_phase, _setup_phase_moved, _setup_torque_free_active
+    global _setup_pose_fail_streak
     global HOME_POSITION, FIRST_SLOT_POSITION, SECOND_SLOT_POSITION, _slot_grab_count
     global GRAB_BASE_OFFSET_STEP, GRAB_BASE_OFFSET_DIRECTION
     now = time.time()
@@ -259,8 +359,12 @@ def _handle_setup_phase():
         _setup_torque_free_active = True
     pose = _read_current_pose()
     if pose is None:
-        core_matrix_set_error_code(ERR_SETUP_POSE_UNAVAILABLE)
+        _setup_pose_fail_streak += 1
+        # Only show error after a short streak, otherwise keep trying silently.
+        if _setup_pose_fail_streak >= 10:
+            core_matrix_set_error_code(ERR_SETUP_POSE_UNAVAILABLE)
         return
+    _setup_pose_fail_streak = 0
 
     if _setup_prev_pose is None:
         _setup_prev_pose = dict(pose)
@@ -331,7 +435,8 @@ def _handle_setup_phase():
         _set_sts_torque_enabled(True)
         _setup_torque_free_active = False
         print("[SETUP] Returning to HOME before idle.")
-        _move_arm_to_home_position()
+        # Return rule: lift arm first, then rotate base.
+        _move_arm_then_base(HOME_POSITION, speed=HOME_MOVE_SPEED, acc=HOME_MOVE_ACC, lift_pose=HOME_POSITION)
         core_matrix_set_setup_step(3)
         _set_state(STATE_DETECT)
 
@@ -379,6 +484,28 @@ def _set_gripper_idle_closed_free():
     _set_gripper_hold(False)
 
 
+def _set_gripper_setup_open_free():
+    _set_gripper_hold(True)
+    _move_servo(GRIPPER_SETUP_OPEN_ANGLE)
+    time.sleep(0.2)
+    _set_gripper_hold(False)
+
+
+def _clamp_pos(v: int) -> int:
+    return max(0, min(4095, int(v)))
+
+
+def _get_delivery_pose() -> dict[int, int]:
+    if DELIVERY_POSITION:
+        return dict(DELIVERY_POSITION)
+    pose = dict(HOME_POSITION)
+    for sid, delta in DELIVERY_DELTAS.items():
+        pose[sid] = _clamp_pos(int(pose.get(sid, 2048)) + int(delta))
+    # Do NOT rotate base for delivery
+    pose[GRAB_BASE_SERVO_ID] = int(HOME_POSITION.get(GRAB_BASE_SERVO_ID, pose.get(GRAB_BASE_SERVO_ID, 2048)))
+    return pose
+
+
 def _move_arm_to_home_position():
     """Muove tutti i servo STS verso la home prima del ritorno a idle."""
     for sid in STS_SERVO_IDS:
@@ -387,6 +514,47 @@ def _move_arm_to_home_position():
             continue
         sts_move_pos(sid, int(target), speed=HOME_MOVE_SPEED, acc=HOME_MOVE_ACC)
     time.sleep(HOME_SETTLE_SEC)
+
+
+def _move_base_then_arm(target_pose: dict[int, int], speed: int, acc: int) -> bool:
+    """Approach: rotate base first (id=1), then move arm joints (2..)."""
+    ok_all = True
+    base = target_pose.get(GRAB_BASE_SERVO_ID)
+    if base is not None:
+        ok_all = ok_all and sts_move_pos(GRAB_BASE_SERVO_ID, int(base), speed=int(speed), acc=int(acc))
+        time.sleep(0.35)
+    for sid in STS_SERVO_IDS:
+        if sid == GRAB_BASE_SERVO_ID:
+            continue
+        target = target_pose.get(sid)
+        if target is None:
+            ok_all = False
+            continue
+        ok_all = ok_all and sts_move_pos(sid, int(target), speed=int(speed), acc=int(acc))
+    time.sleep(HOME_SETTLE_SEC)
+    return ok_all
+
+
+def _move_arm_then_base(target_pose: dict[int, int], speed: int, acc: int, lift_pose: dict[int, int] | None = None) -> bool:
+    """Return: lift arm joints first (2..), then rotate base (id=1)."""
+    ok_all = True
+    # Lift/position arm joints first (keep base unchanged here)
+    src = lift_pose if lift_pose is not None else target_pose
+    for sid in STS_SERVO_IDS:
+        if sid == GRAB_BASE_SERVO_ID:
+            continue
+        target = src.get(sid)
+        if target is None:
+            ok_all = False
+            continue
+        ok_all = ok_all and sts_move_pos(sid, int(target), speed=int(speed), acc=int(acc))
+    time.sleep(0.35)
+    # Then rotate base
+    base = target_pose.get(GRAB_BASE_SERVO_ID)
+    if base is not None:
+        ok_all = ok_all and sts_move_pos(GRAB_BASE_SERVO_ID, int(base), speed=int(speed), acc=int(acc))
+    time.sleep(HOME_SETTLE_SEC)
+    return ok_all
 
 
 def _move_arm_to_pose(target_pose: dict[int, int], speed: int = HOME_MOVE_SPEED, acc: int = HOME_MOVE_ACC) -> bool:
@@ -405,7 +573,7 @@ def _move_arm_to_pose(target_pose: dict[int, int], speed: int = HOME_MOVE_SPEED,
 
 def _state_machine_worker():
     """Runs grab and release sequences with timed waits."""
-    global _state, _slot_grab_count
+    global _state, _slot_grab_count, _grab_offset_warn_ts
     while True:
         time.sleep(0.08)
         with _state_lock:
@@ -415,6 +583,15 @@ def _state_machine_worker():
         elif s == STATE_GRAB:
             with _state_lock:
                 _state = "grab_running"
+            # Side-effects for UI + LED matrix even while we keep the worker state in "grab_running".
+            try:
+                led_matrix_set_state_name(STATE_GRAB)
+            except Exception:
+                pass
+            try:
+                ui.send_message("state", message={"state": STATE_GRAB})
+            except Exception:
+                pass
             if not FIRST_SLOT_POSITION:
                 print("[GRAB] First slot not configured yet.")
                 core_matrix_set_error_code(ERR_GRAB_SLOT_NOT_CONFIGURED)
@@ -424,14 +601,42 @@ def _state_machine_worker():
             slot_idx = _slot_grab_count % GRAB_SLOT_COUNT_MAX
             target_pose = dict(FIRST_SLOT_POSITION)
             base_raw = int(target_pose.get(GRAB_BASE_SERVO_ID, 2048))
+
+            # Warn if default base offset likely causes clamping/duplicates.
+            now_ts = time.time()
+            if now_ts - _grab_offset_warn_ts > 20.0:
+                positions = []
+                clamped_low = 0
+                clamped_high = 0
+                for i in range(GRAB_SLOT_COUNT_MAX):
+                    v = base_raw + int(GRAB_BASE_OFFSET_STEP) * int(i) * int(GRAB_BASE_OFFSET_DIRECTION)
+                    v = max(0, min(4095, v))
+                    if v == 0:
+                        clamped_low += 1
+                    if v == 4095:
+                        clamped_high += 1
+                    positions.append(v)
+                unique_count = len(set(positions))
+                if unique_count < GRAB_SLOT_COUNT_MAX or clamped_low or clamped_high:
+                    print(
+                        "[GRAB][WARN] base offset might be too aggressive: "
+                        f"unique_positions={unique_count}/{GRAB_SLOT_COUNT_MAX}, "
+                        f"clamped_low={clamped_low}, clamped_high={clamped_high}. "
+                        "Consider lowering GRAB_BASE_OFFSET_STEP or adjusting direction."
+                    )
+                    _grab_offset_warn_ts = now_ts
+
             offset = int(GRAB_BASE_OFFSET_STEP) * int(slot_idx) * int(GRAB_BASE_OFFSET_DIRECTION)
             target_pose[GRAB_BASE_SERVO_ID] = max(0, min(4095, base_raw + offset))
 
-            # Grab sequence: small open -> slow approach -> settle -> close max -> slow return home (closed)
+            # Grab rules:
+            # - Approach (go take gadget): rotate base first, then lower arm.
+            # - Return (got gadget): lift arm first, then rotate base.
+            # - Keep gripper closed and holding torque until delivery pose.
             _set_gripper_hold(True)
             _move_servo(GRIPPER_GRAB_PREOPEN_ANGLE)
             time.sleep(GRAB_OPEN_WAIT_SEC)
-            _move_arm_to_pose(target_pose, speed=GRAB_APPROACH_SPEED, acc=GRAB_APPROACH_ACC)
+            _move_base_then_arm(target_pose, speed=GRAB_APPROACH_SPEED, acc=GRAB_APPROACH_ACC)
             time.sleep(GRAB_SETTLE_BEFORE_CLOSE_SEC)
             p_open = get_pressure()
             print(f"[GRAB][PRESSURE][open] A0={p_open.get('a0')} A1={p_open.get('a1')}")
@@ -439,19 +644,34 @@ def _state_machine_worker():
             time.sleep(GRAB_CLOSE_WAIT_SEC)
             p_closed = get_pressure()
             print(f"[GRAB][PRESSURE][after_pick] A0={p_closed.get('a0')} A1={p_closed.get('a1')}")
-            _move_arm_to_pose(HOME_POSITION, speed=GRAB_RETURN_SPEED, acc=GRAB_RETURN_ACC)
-            # Keep object clamped until we are back at HOME, then wait user pickup time.
+            _move_arm_then_base(HOME_POSITION, speed=GRAB_RETURN_SPEED, acc=GRAB_RETURN_ACC, lift_pose=HOME_POSITION)
+
+            # Delivery: from HOME, without rotating base, reach forward and present gadget.
+            delivery_pose = _get_delivery_pose()
+            _move_arm_to_pose(delivery_pose, speed=DELIVERY_SPEED, acc=DELIVERY_ACC)
+
+            # Keep object clamped until delivery pose, then wait user pickup time.
             time.sleep(GRAB_WAIT_BEFORE_HOME_SEC)
             _move_servo(GRIPPER_OPEN_ANGLE)
             time.sleep(0.8)
             _move_servo(GRIPPER_CLOSED_ANGLE)
             time.sleep(0.6)
+            # Return arm back to HOME pose (no base rotation needed)
+            _move_arm_to_pose(HOME_POSITION, speed=DELIVERY_SPEED, acc=DELIVERY_ACC)
             _slot_grab_count = (_slot_grab_count + 1) % GRAB_SLOT_COUNT_MAX
             print(f"[GRAB] completed slot #{_slot_grab_count if _slot_grab_count > 0 else GRAB_SLOT_COUNT_MAX}")
             _set_state(STATE_DETECT)
         elif s == STATE_RELEASE:
             with _state_lock:
                 _state = "release_running"
+            try:
+                led_matrix_set_state_name(STATE_RELEASE)
+            except Exception:
+                pass
+            try:
+                ui.send_message("state", message={"state": STATE_RELEASE})
+            except Exception:
+                pass
             _move_servo(GRIPPER_OPEN_ANGLE)
             time.sleep(RELEASE_OPEN_WAIT_SEC)
             _set_state(STATE_DETECT)
@@ -815,14 +1035,49 @@ ui.expose_api("GET", "/api/grab_offset_config", grab_offset_config)
 
 
 def _bridge_call_and_unwrap(method: str, *args):
-    """Helper: call a Bridge method and unwrap async result objects if needed."""
-    res = Bridge.call(method, *args)
-    if hasattr(res, "result"):
-        try:
-            return res.result()
-        except Exception:
-            return None
-    return res
+    """Helper: call a Bridge method and unwrap async result objects if needed.
+    Uses _bridge_lock to prevent concurrent calls from multiple threads timing out."""
+    def _is_transient_bridge_error(msg: str) -> bool:
+        msg = msg.lower()
+        # Heuristics for common startup/transient transport failures.
+        markers = (
+            "timed out",
+            "timeout",
+            "temporar",
+            "connection",
+            "disconnected",
+            "closed",
+            "broken pipe",
+            "reset",
+            "not ready",
+            "not connected",
+            "unavailable",
+            "busy",
+            "transport",
+        )
+        return any(m in msg for m in markers)
+
+    with _bridge_lock:
+        for attempt in range(BRIDGE_CALL_RETRIES):
+            try:
+                res = Bridge.call(method, *args)
+                if hasattr(res, "result"):
+                    try:
+                        return res.result()
+                    except Exception as e:
+                        msg = str(e)
+                        if attempt < (BRIDGE_CALL_RETRIES - 1) and _is_transient_bridge_error(msg):
+                            time.sleep(BRIDGE_CALL_RETRY_DELAY_SEC)
+                            continue
+                        return None
+                return res
+            except Exception as e:
+                msg = str(e)
+                if attempt < (BRIDGE_CALL_RETRIES - 1) and _is_transient_bridge_error(msg):
+                    time.sleep(BRIDGE_CALL_RETRY_DELAY_SEC)
+                    continue
+                return None
+    return None
 
 
 def sts_ping(servo_id: int) -> bool:
@@ -864,7 +1119,11 @@ def sts_read_pos(servo_id: int) -> int | None:
         res = _bridge_call_and_unwrap("sts_read_pos", int(servo_id))
         if res is None:
             return None
-        return int(res)
+        v = int(res)
+        # SCServo returns negative on error.
+        if v < 0:
+            return None
+        return v
     except Exception as e:
         print(f"[STS3215] read_pos error for id={servo_id}: {e}")
         return None

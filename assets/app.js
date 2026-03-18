@@ -25,8 +25,6 @@ let setFirstSlotStatus;
 let goHomeButton;
 let goFirstSlotButton;
 let stateCheckpointButtons = [];
-let matrixIntensitySlider;
-let matrixIntensityValue;
 let matrixAvailabilityEl;
 let matrixStatusEl;
 let matrixClearButton;
@@ -454,13 +452,6 @@ function refreshLedMatrixStatus() {
                 matrixAvailabilityEl.textContent = available ? 'available' : 'not detected';
                 matrixAvailabilityEl.style.color = available ? '#4ecca3' : '#ffc107';
             }
-            if (matrixIntensitySlider && data && data.intensity != null) {
-                matrixIntensitySlider.value = String(data.intensity);
-            }
-            if (matrixIntensityValue && data && data.intensity != null) {
-                matrixIntensityValue.textContent = String(data.intensity);
-            }
-            if (matrixIntensitySlider) matrixIntensitySlider.disabled = !available;
             if (matrixClearButton) matrixClearButton.disabled = !available;
         })
         .catch(() => {
@@ -472,31 +463,9 @@ function refreshLedMatrixStatus() {
 }
 
 function initLedMatrixControls() {
-    matrixIntensitySlider = document.getElementById('matrixIntensity');
-    matrixIntensityValue = document.getElementById('matrix-intensity-value');
     matrixAvailabilityEl = document.getElementById('matrix-availability');
     matrixStatusEl = document.getElementById('matrix-status');
     matrixClearButton = document.getElementById('matrixClearButton');
-
-    if (matrixIntensitySlider && matrixIntensityValue) {
-        matrixIntensitySlider.addEventListener('input', () => {
-            matrixIntensityValue.textContent = matrixIntensitySlider.value;
-        });
-        matrixIntensitySlider.addEventListener('change', () => {
-            const value = parseInt(matrixIntensitySlider.value, 10);
-            fetch(`/api/led_matrix_intensity?value=${value}`)
-                .then((res) => res.json())
-                .then((data) => {
-                    if (data && data.ok) {
-                        setMatrixStatusText(`Brightness: ${value}`, false);
-                    } else {
-                        const err = data && data.error ? data.error : 'Matrix intensity error';
-                        setMatrixStatusText(err, true);
-                    }
-                })
-                .catch(() => setMatrixStatusText('Network error on matrix intensity', true));
-        });
-    }
 
     if (matrixClearButton) {
         matrixClearButton.addEventListener('click', () => {
