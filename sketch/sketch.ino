@@ -416,14 +416,11 @@ int core_matrix_set_error_code(int code) {
 
 int led_matrix_set_intensity(int level) {
   // Head matrix (ModulinoLEDMatrix) does not expose a brightness API in this project.
-  // We still implement intensity for the UNO Q onboard coreMatrix so the UI slider
-  // actually affects hardware.
+  // Intensity for the UNO Q onboard coreMatrix is not supported by Arduino_LED_Matrix
+  // in this environment, so we only keep the RAM value for API compatibility.
   if (level < 0) level = 0;
   if (level > 15) level = 15;
   led_matrix_intensity = level;
-  if (core_matrix_ready) {
-    coreMatrix.setIntensity((uint8_t)level);
-  }
   return 1;
 }
 

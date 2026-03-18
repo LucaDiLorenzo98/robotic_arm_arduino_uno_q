@@ -3,7 +3,6 @@
 # SPDX-License-Identifier: MPL-2.0
 
 from arduino.app_utils import App, Bridge
-from arduino.app_bricks.web_ui import WebUI
 from arduino.app_bricks.video_objectdetection import VideoObjectDetection
 from datetime import datetime, UTC
 import time
@@ -95,19 +94,23 @@ BRIDGE_CALL_RETRY_DELAY_SEC = 0.25
 def _print_sts_servo_info():
     """Stampa a console ping e posizione per ogni ID STS3215 (per check)."""
     print("[STS3215] Check servo (ping + posizione):\n")
+    all_ok = True
     for sid in STS_CHECK_IDS:
+        print(f"[STS3215] checking id={sid} ...")
         ok = sts_ping(sid)
         pos = sts_read_pos(sid)
         pos_str = str(pos) if pos is not None else "—"
         status = "OK" if ok else "NO"
+        all_ok = all_ok and ok and pos is not None
         print(f"  ID={sid}  ping={status}  pos={pos_str}")
     print()
+    return all_ok
 
 
 def _startup_sts_check():
     """Esegue il check STS dopo un breve delay (Bridge deve essere connesso)."""
-    time.sleep(STS_STARTUP_DELAY_SEC)
     try:
+        time.sleep(STS_STARTUP_DELAY_SEC)
         # Clear indication: now it's safe to start setup and move the robot by hand.
         core_matrix_set_setup_step(1)
         print("[SETUP] Move robot to HOME, then hold still 5s.")
@@ -118,10 +121,17 @@ def _startup_sts_check():
         _setup_nod_servo4()
         _set_sts_torque_enabled(False)
         _set_gripper_setup_open_free()
-        _print_sts_servo_info()
+        all_ok = _print_sts_servo_info()
+        if not all_ok:
+            core_matrix_set_error_code(ERR_SETUP_POSE_UNAVAILABLE)
+            print(
+                "[SETUP][ERROR] One or more STS3215 servos did not respond (check wiring/half-duplex adapter/IDs)."
+            )
         print("[SETUP] READY: you can move the arm now.")
     except Exception as e:
         print(f"[STS3215] startup check failed: {e}")
+    finally:
+        _startup_check_done.set()
 
 
 # State machine: setup -> detect -> (face) -> grab -> detect
@@ -171,7 +181,13 @@ SECOND_SLOT_POSITION: dict[int, int] = {}
 
 # Setup automatico: fermo per N secondi -> salva posizione.
 SETUP_STABLE_SECONDS = 5.0
-SETUP_MOVEMENT_THRESHOLD = 25
+# Threshold for detecting "manual movement" while torque is OFF.
+# Too low can trigger on micro-movement / sensor noise during settling.
+SETUP_MOVEMENT_THRESHOLD = 40
+
+# After switching torque OFF, ignore movement detection for a short grace period
+# so the arm can settle under gravity without automatically advancing setup.
+SETUP_MOVEMENT_ARM_DELAY_SEC = 1.5
 SETUP_NOD_DELTA_SERVO4 = 120
 SETUP_NOD_SPEED = 500
 SETUP_NOD_ACC = 20
@@ -183,7 +199,8 @@ GRAB_BASE_SERVO_ID = 1
 GRAB_BASE_OFFSET_STEP = 300
 GRAB_BASE_OFFSET_DIRECTION = -1  # +1 o -1
 
-ui = WebUI()
+# Web UI disabilitata: manteniamo solo face detection + logica robot.
+ui = None
 detection_stream = VideoObjectDetection(confidence=0.85, debounce_sec=0.0)
 
 _state = STATE_SETUP
@@ -196,6 +213,11 @@ _setup_torque_free_active = False
 _setup_pose_fail_streak = 0
 _slot_grab_count = 0
 _grab_offset_warn_ts = 0.0
+_setup_movement_arm_ts = 0.0
+
+# Wait until the startup STS/LED routine has finished (servo nod + ping).
+_startup_check_done = threading.Event()
+_pose_capture_fail_print_ts = 0.0
 
 # Idle animation (STS3215) configuration
 IDLE_ANIM_ENABLED = True
@@ -279,6 +301,12 @@ def _capture_current_pose() -> dict[int, int] | None:
         for sid in STS_SERVO_IDS:
             pos = sts_read_pos(sid)
             if pos is None:
+                global _pose_capture_fail_print_ts
+                now_ts = time.time()
+                # Rate limit: print at most once per ~2s.
+                if now_ts - _pose_capture_fail_print_ts > 2.0:
+                    print(f"[STS3215] capture pose failed at id={sid}.")
+                    _pose_capture_fail_print_ts = now_ts
                 ok = False
                 break
             current[sid] = int(pos)
@@ -351,15 +379,19 @@ def _handle_setup_phase():
     """Auto setup: hold still 5s to capture HOME, FIRST_SLOT, SECOND_SLOT."""
     global _setup_prev_pose, _setup_stable_since, _setup_phase, _setup_phase_moved, _setup_torque_free_active
     global _setup_pose_fail_streak
+    global _setup_movement_arm_ts
     global HOME_POSITION, FIRST_SLOT_POSITION, SECOND_SLOT_POSITION, _slot_grab_count
     global GRAB_BASE_OFFSET_STEP, GRAB_BASE_OFFSET_DIRECTION
     now = time.time()
     if not _setup_torque_free_active:
         _set_sts_torque_enabled(False)
         _setup_torque_free_active = True
+        _setup_movement_arm_ts = now + SETUP_MOVEMENT_ARM_DELAY_SEC
     pose = _read_current_pose()
     if pose is None:
         _setup_pose_fail_streak += 1
+        if _setup_pose_fail_streak == 1:
+            print("[SETUP] pose read returned None (STS timeout or invalid read).")
         # Only show error after a short streak, otherwise keep trying silently.
         if _setup_pose_fail_streak >= 10:
             core_matrix_set_error_code(ERR_SETUP_POSE_UNAVAILABLE)
@@ -370,6 +402,12 @@ def _handle_setup_phase():
         _setup_prev_pose = dict(pose)
         _setup_stable_since = now
         print(f"[SETUP] Phase={_setup_phase}: move arm by hand, then keep still {SETUP_STABLE_SECONDS:.0f}s.")
+        return
+
+    # Ignore movement detection during the first delay after torque OFF,
+    # otherwise the arm "settling" can auto-advance setup.
+    if now < _setup_movement_arm_ts:
+        _setup_prev_pose = dict(pose)
         return
 
     moved = _pose_has_movement(pose, _setup_prev_pose, SETUP_MOVEMENT_THRESHOLD)
@@ -396,6 +434,7 @@ def _handle_setup_phase():
         _setup_nod_servo4()
         _set_sts_torque_enabled(False)
         _setup_torque_free_active = True
+        _setup_movement_arm_ts = time.time() + SETUP_MOVEMENT_ARM_DELAY_SEC
         _setup_phase = "first_slot"
         _setup_phase_moved = False
         _setup_prev_pose = None
@@ -410,6 +449,7 @@ def _handle_setup_phase():
         _setup_phase_moved = False
         _setup_prev_pose = None
         _setup_stable_since = now
+        _setup_movement_arm_ts = time.time() + SETUP_MOVEMENT_ARM_DELAY_SEC
         core_matrix_set_setup_step(2)
         return
 
@@ -449,10 +489,6 @@ def _set_state(new_state: str):
         _setup_torque_free_active = False
     with _state_lock:
         _state = new_state
-    try:
-        ui.send_message("state", message={"state": new_state})
-    except Exception:
-        pass
     try:
         led_matrix_set_state_name(new_state)
     except Exception:
@@ -579,6 +615,9 @@ def _state_machine_worker():
         with _state_lock:
             s = _state
         if s == STATE_SETUP:
+            # Avoid overlapping the startup STS/LED routine with the setup FSM.
+            if not _startup_check_done.is_set():
+                continue
             _handle_setup_phase()
         elif s == STATE_GRAB:
             with _state_lock:
@@ -586,10 +625,6 @@ def _state_machine_worker():
             # Side-effects for UI + LED matrix even while we keep the worker state in "grab_running".
             try:
                 led_matrix_set_state_name(STATE_GRAB)
-            except Exception:
-                pass
-            try:
-                ui.send_message("state", message={"state": STATE_GRAB})
             except Exception:
                 pass
             if not FIRST_SLOT_POSITION:
@@ -666,10 +701,6 @@ def _state_machine_worker():
                 _state = "release_running"
             try:
                 led_matrix_set_state_name(STATE_RELEASE)
-            except Exception:
-                pass
-            try:
-                ui.send_message("state", message={"state": STATE_RELEASE})
             except Exception:
                 pass
             _move_servo(GRIPPER_OPEN_ANGLE)
@@ -805,7 +836,9 @@ def face_detected():
     _set_state(STATE_GRAB)
 
 
-ui.on_message("override_th", lambda sid, threshold: detection_stream.override_threshold(threshold))
+#
+# WebUI disabilitata: override_th (slider UI) non viene più gestita.
+#
 
 
 def get_pressure():
@@ -908,12 +941,9 @@ def set_state_checkpoint(state=None):
         return {"ok": False, "error": str(e)}
 
 
-ui.expose_api("GET", "/api/pressure", get_pressure)
-ui.expose_api("GET", "/api/state", get_state)
-ui.expose_api("GET", "/api/led_matrix_status", get_led_matrix_status)
-ui.expose_api("GET", "/api/led_matrix_intensity", set_led_matrix_intensity)
-ui.expose_api("GET", "/api/led_matrix_clear", clear_led_matrix)
-ui.expose_api("GET", "/api/set_state", set_state_checkpoint)
+#
+# WebUI disabilitata: nessuna expose_api registrata.
+#
 
 
 def get_servo_positions():
@@ -934,10 +964,6 @@ def set_home_current():
 
     HOME_POSITION = dict(valid)
     payload = _pose_payload(HOME_POSITION)
-    try:
-        ui.send_message("home_updated", message={"home": payload})
-    except Exception:
-        pass
     return {"ok": True, "home": payload}
 
 
@@ -950,10 +976,6 @@ def set_first_slot_current():
 
     FIRST_SLOT_POSITION = dict(valid)
     payload = _pose_payload(FIRST_SLOT_POSITION)
-    try:
-        ui.send_message("first_slot_updated", message={"first_slot": payload})
-    except Exception:
-        pass
     return {"ok": True, "first_slot": payload}
 
 
@@ -1025,13 +1047,9 @@ def servo_move(id=None, position=None):
         return {"ok": False, "error": str(e)}
 
 
-ui.expose_api("GET", "/api/servo_positions", get_servo_positions)
-ui.expose_api("GET", "/api/servo_move", servo_move)
-ui.expose_api("GET", "/api/set_home_current", set_home_current)
-ui.expose_api("GET", "/api/set_first_slot_current", set_first_slot_current)
-ui.expose_api("GET", "/api/go_home", go_to_home)
-ui.expose_api("GET", "/api/go_first_slot", go_to_first_slot)
-ui.expose_api("GET", "/api/grab_offset_config", grab_offset_config)
+#
+# WebUI disabilitata: nessuna expose_api registrata.
+#
 
 
 def _bridge_call_and_unwrap(method: str, *args):
@@ -1244,7 +1262,7 @@ def send_detections_to_ui(detections: dict):
                 "confidence": confidence,
                 "timestamp": datetime.now(UTC).isoformat(),
             }
-            ui.send_message("detection", message=entry)
+            # Web UI disabilitata: non inviamo detections all'interfaccia web.
         # Move servo when we see a face (in case on_detect used different label)
         if key.lower() == "face" and items and items[0][1] >= 0.85:
             face_detected()
