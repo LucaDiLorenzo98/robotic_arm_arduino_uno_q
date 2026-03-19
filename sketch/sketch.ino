@@ -26,6 +26,7 @@
 #define PRESSURE_PIN_A1 A1
 
 Servo servo;
+int lastServoAngle = 180;  // track last commanded angle (default: closed)
 SMS_STS sts;  // STS3215 serial bus controller
 
 Arduino_LED_Matrix coreMatrix;
@@ -121,6 +122,22 @@ static void _head_draw_eyes_release() {
   _head_capsule_filled(7, 1, 4, 6);
 }
 
+static void _head_draw_eyes_heart() {
+  // Heart-shaped eyes on 12x8 matrix.
+  // Left heart (cols 0-4, rows 0-7)
+  _head_point(1, 1); _head_point(2, 0); _head_point(3, 1);
+  _head_point(0, 2); _head_point(1, 2); _head_point(2, 2); _head_point(3, 2); _head_point(4, 2);
+  _head_point(0, 3); _head_point(1, 3); _head_point(2, 3); _head_point(3, 3); _head_point(4, 3);
+  _head_point(1, 4); _head_point(2, 4); _head_point(3, 4);
+  _head_point(2, 5);
+  // Right heart (cols 7-11, rows 0-7)
+  _head_point(8, 1); _head_point(9, 0); _head_point(10, 1);
+  _head_point(7, 2); _head_point(8, 2); _head_point(9, 2); _head_point(10, 2); _head_point(11, 2);
+  _head_point(7, 3); _head_point(8, 3); _head_point(9, 3); _head_point(10, 3); _head_point(11, 3);
+  _head_point(8, 4); _head_point(9, 4); _head_point(10, 4);
+  _head_point(9, 5);
+}
+
 static void _head_render_state(int state_code, bool blink_closed) {
   if (!head_matrix_ready) return;
   _head_clear_draw();
@@ -131,6 +148,8 @@ static void _head_render_state(int state_code, bool blink_closed) {
     _head_draw_eyes_grab();
   } else if (state_code == 2) { // release
     _head_draw_eyes_release();
+  } else if (state_code == 4) { // heart eyes (delivery)
+    _head_draw_eyes_heart();
   } else { // setup
     _head_draw_eyes_open();
     // No extra indicator pixels (avoid "stuck" top-right LED)
@@ -160,26 +179,34 @@ static void _head_tick() {
   }
 }
 
-// Called from Python when a face is detected. Angle in degrees (0-180).
-void move_servo(int angle) {
+// Helper: convert angle (0-180) to microseconds (500-2500).
+int _angleToUs(int angle) {
+  return map(angle, 0, 180, 500, 2500);
+}
+
+// Helper: attach servo and immediately restore last position (no 90° glitch).
+void _safeAttach() {
   if (!servo.attached()) {
-    servo.attach(SERVO_PIN);
+    servo.attach(SERVO_PIN, 500, 2500);
+    servo.writeMicroseconds(_angleToUs(lastServoAngle));
   }
+}
+
+// Called from Python when a face is detected. Angle in degrees (0-180).
+int move_servo(int angle) {
   if (angle < 0) angle = 0;
   if (angle > 180) angle = 180;
+  _safeAttach();
   servo.write(angle);
+  lastServoAngle = angle;
+  return 1;
 }
 
 int gripper_hold(int hold) {
   if (hold) {
-    if (!servo.attached()) {
-      servo.attach(SERVO_PIN);
-    }
-  } else {
-    if (servo.attached()) {
-      servo.detach();
-    }
+    _safeAttach();
   }
+  // Never detach — servo always holds position
   return 1;
 }
 
@@ -414,6 +441,13 @@ int core_matrix_set_error_code(int code) {
   return 0;
 }
 
+int core_matrix_clear() {
+  if (!core_matrix_ready) return -1;
+  uint8_t blank[104] = {0};
+  coreMatrix.draw(blank);
+  return 1;
+}
+
 int led_matrix_set_intensity(int level) {
   // Head matrix (ModulinoLEDMatrix) does not expose a brightness API in this project.
   // Intensity for the UNO Q onboard coreMatrix is not supported by Arduino_LED_Matrix
@@ -444,9 +478,9 @@ int led_matrix_set_state(int state_code) {
 void setup() {
   Bridge.begin();
 
-  // Standard PWM servo on D9 (gripper)
-  servo.attach(SERVO_PIN);
-  servo.write(0);
+  // Standard PWM servo on D9 (gripper) — start at 180° (closed)
+  servo.attach(SERVO_PIN, 500, 2500);
+  servo.write(lastServoAngle);  // 180 = closed
 
   // STS3215 serial bus on Serial (UNO Q side)
   Serial.begin(1000000);
@@ -487,6 +521,7 @@ void setup() {
   Bridge.provide_safe("led_matrix_set_state", led_matrix_set_state);
   Bridge.provide_safe("core_matrix_set_setup_step", core_matrix_set_setup_step);
   Bridge.provide_safe("core_matrix_set_error_code", core_matrix_set_error_code);
+  Bridge.provide_safe("core_matrix_clear", core_matrix_clear);
 }
 
 void loop() {

@@ -43,14 +43,33 @@ def _enable_unbuffered_console_and_file_log() -> None:
         def __init__(self, a, b):
             self._a = a
             self._b = b
+            self._at_line_start = True
 
         def write(self, s):
+            if not s:
+                return 0
+            # Prepend timestamp at the start of each line.
+            from datetime import datetime as _dt
+            parts = s.split("\n")
+            out_parts = []
+            for i, part in enumerate(parts):
+                if i > 0:
+                    out_parts.append("\n")
+                    self._at_line_start = True
+                if part:
+                    if self._at_line_start:
+                        ts = _dt.now().strftime("%H:%M:%S.%f")[:-3]
+                        out_parts.append(f"[{ts}] {part}")
+                    else:
+                        out_parts.append(part)
+                    self._at_line_start = False
+            stamped = "".join(out_parts)
             try:
-                self._a.write(s)
+                self._a.write(stamped)
             except Exception:
                 pass
             try:
-                self._b.write(s)
+                self._b.write(stamped)
             except Exception:
                 pass
             return len(s)
@@ -88,6 +107,7 @@ STS_STARTUP_DELAY_SEC = 6.0  # Attesa prima del check (Bridge/MCU/servo bus devo
 # Bridge calls can time out during early startup or transient USB/serial hiccups.
 BRIDGE_CALL_RETRIES = 3
 BRIDGE_CALL_RETRY_DELAY_SEC = 0.25
+BRIDGE_RESULT_TIMEOUT_SEC = 5.0  # Prevent deadlock if MCU never responds to .result()
 
 
 
@@ -111,6 +131,12 @@ def _startup_sts_check():
     """Esegue il check STS dopo un breve delay (Bridge deve essere connesso)."""
     try:
         time.sleep(STS_STARTUP_DELAY_SEC)
+        # Initialize LED matrix now that Bridge is ready.
+        try:
+            led_matrix_set_intensity(_led_matrix_intensity)
+            led_matrix_set_state_name(STATE_SETUP)
+        except Exception:
+            pass
         # Clear indication: now it's safe to start setup and move the robot by hand.
         core_matrix_set_setup_step(1)
         print("[SETUP] Move robot to HOME, then hold still 5s.")
@@ -134,17 +160,20 @@ def _startup_sts_check():
         _startup_check_done.set()
 
 
-# State machine: setup -> detect -> (face) -> grab -> detect
+# State machine: setup -> detect -> (face) -> grab -> delivery -> (face) -> release -> detect
 STATE_SETUP = "setup"
 STATE_DETECT = "detect"
 STATE_GRAB = "grab"
+STATE_DELIVERY = "delivery"
 STATE_RELEASE = "release"
 
 # Gripper servo angles (adjust if your servo is reversed)
-GRIPPER_OPEN_ANGLE = 0
-GRIPPER_CLOSED_ANGLE = 90
-GRIPPER_GRAB_PREOPEN_ANGLE = 12  # open just a little before slot approach
-GRIPPER_SETUP_OPEN_ANGLE = 12  # slightly open during setup
+GRIPPER_OPEN_ANGLE = 150  # fully open
+GRIPPER_CLOSED_ANGLE = 180  # fully closed (max grip)
+GRIPPER_GRAB_PREOPEN_ANGLE = 165  # narrow opening (~2cm) to grab a pen
+GRIPPER_GRAB_PRE_CLOSE_ANGLE = 25  # micro-close after reaching gadget point
+GRIPPER_GRAB_PRE_CLOSE_WAIT_SEC = 0.35
+GRIPPER_SETUP_OPEN_ANGLE = GRIPPER_GRAB_PREOPEN_ANGLE  # same opening as pre-grab
 
 GRAB_OPEN_WAIT_SEC = 1.0
 GRAB_CLOSE_WAIT_SEC = 1.0
@@ -155,6 +184,8 @@ GRAB_APPROACH_ACC = 20
 GRAB_RETURN_SPEED = 800
 GRAB_RETURN_ACC = 25
 RELEASE_OPEN_WAIT_SEC = 3.0
+DELIVERY_HEART_SEC = 3.0  # show heart eyes then release pen
+DELIVERY_POST_RELEASE_HOME_SEC = 5.0  # wait at home before returning to idle
 
 # Delivery pose (RAM-only). If not set, computed as HOME + DELIVERY_DELTAS (no base rotation).
 DELIVERY_POSITION: dict[int, int] = {}
@@ -192,6 +223,7 @@ SETUP_NOD_DELTA_SERVO4 = 120
 SETUP_NOD_SPEED = 500
 SETUP_NOD_ACC = 20
 SETUP_NOD_DELAY_SEC = 0.30
+SETUP_BLINK_INTERVAL_SEC = 0.5  # blink period during "hold still" countdown
 
 # Grab sequenziale su 9 slot con offset base servo1 configurabile.
 GRAB_SLOT_COUNT_MAX = 9
@@ -209,11 +241,20 @@ _setup_phase = "home"  # home -> first_slot -> second_slot -> done
 _setup_prev_pose: dict[int, int] | None = None
 _setup_stable_since = 0.0
 _setup_phase_moved = False  # diventa True quando rileva movimento manuale nella fase corrente
+_setup_anchor_pose: dict[int, int] | None = None  # pose recorded when arm first appears still
 _setup_torque_free_active = False
 _setup_pose_fail_streak = 0
+_setup_last_blink_ts = 0.0
+_setup_blink_on = True
 _slot_grab_count = 0
 _grab_offset_warn_ts = 0.0
 _setup_movement_arm_ts = 0.0
+
+# Cooldown: after setup→detect, ignore face detections for a few seconds
+# so the system stabilises (idle animation init, Bridge settling, etc.).
+DETECT_COOLDOWN_SEC = 4.0
+_detect_cooldown_until = 0.0
+_delivery_face_seen = threading.Event()  # signaled when face detected during delivery
 
 # Wait until the startup STS/LED routine has finished (servo nod + ping).
 _startup_check_done = threading.Event()
@@ -360,6 +401,17 @@ def _pose_has_movement(pose_a: dict[int, int], pose_b: dict[int, int], threshold
     return False
 
 
+def _setup_current_step_number() -> int:
+    """Map setup phase to display step: S1=HOME, S2=FIRST_SLOT, S3=SECOND_SLOT."""
+    if _setup_phase == "home":
+        return 1
+    if _setup_phase == "first_slot":
+        return 2
+    if _setup_phase == "second_slot":
+        return 3
+    return 1
+
+
 def _setup_nod_servo4():
     sid = 4
     center = HOME_POSITION.get(sid)
@@ -378,7 +430,7 @@ def _setup_nod_servo4():
 def _handle_setup_phase():
     """Auto setup: hold still 5s to capture HOME, FIRST_SLOT, SECOND_SLOT."""
     global _setup_prev_pose, _setup_stable_since, _setup_phase, _setup_phase_moved, _setup_torque_free_active
-    global _setup_pose_fail_streak
+    global _setup_pose_fail_streak, _setup_last_blink_ts, _setup_blink_on
     global _setup_movement_arm_ts
     global HOME_POSITION, FIRST_SLOT_POSITION, SECOND_SLOT_POSITION, _slot_grab_count
     global GRAB_BASE_OFFSET_STEP, GRAB_BASE_OFFSET_DIRECTION
@@ -410,6 +462,7 @@ def _handle_setup_phase():
         _setup_prev_pose = dict(pose)
         return
 
+    global _setup_anchor_pose
     moved = _pose_has_movement(pose, _setup_prev_pose, SETUP_MOVEMENT_THRESHOLD)
     _setup_prev_pose = dict(pose)
     if moved:
@@ -417,13 +470,36 @@ def _handle_setup_phase():
             print(f"[SETUP] Phase={_setup_phase}: movement detected, waiting stable hold...")
         _setup_phase_moved = True
         _setup_stable_since = now
+        _setup_anchor_pose = None  # reset anchor on any fast movement
         return
 
     # Evita catture premature: la fase si arma solo dopo almeno un movimento manuale.
     if not _setup_phase_moved:
         return
 
+    # Compare against anchor pose (catches slow drift during repositioning).
+    # The anchor is set when the arm first appears still after movement.
+    if _setup_anchor_pose is None:
+        _setup_anchor_pose = dict(pose)
+        _setup_stable_since = now  # timer starts from anchor
+    else:
+        drifted = _pose_has_movement(pose, _setup_anchor_pose, SETUP_MOVEMENT_THRESHOLD)
+        if drifted:
+            # Slow drift from anchor — arm is still being repositioned
+            _setup_anchor_pose = dict(pose)
+            _setup_stable_since = now
+            return
+
     if (now - _setup_stable_since) < SETUP_STABLE_SECONDS:
+        # Blink the step number on the onboard matrix so the user sees "hold still".
+        if (now - _setup_last_blink_ts) >= SETUP_BLINK_INTERVAL_SEC:
+            _setup_last_blink_ts = now
+            _setup_blink_on = not _setup_blink_on
+            step = _setup_current_step_number()
+            if _setup_blink_on:
+                core_matrix_set_setup_step(step)
+            else:
+                core_matrix_clear()
         return
 
     if _setup_phase == "home":
@@ -437,20 +513,39 @@ def _handle_setup_phase():
         _setup_movement_arm_ts = time.time() + SETUP_MOVEMENT_ARM_DELAY_SEC
         _setup_phase = "first_slot"
         _setup_phase_moved = False
+        _setup_anchor_pose = None
         _setup_prev_pose = None
         _setup_stable_since = now
-        core_matrix_set_setup_step(1)
+        _setup_blink_on = True
+        core_matrix_set_setup_step(2)  # S2 = move to first slot
         return
 
     if _setup_phase == "first_slot":
         FIRST_SLOT_POSITION = dict(pose)
         print(f"[SETUP] FIRST_SLOT captured: {FIRST_SLOT_POSITION}")
+
+        # Return to HOME between slot captures so the user can position
+        # the arm consistently for SECOND_SLOT.
+        _set_sts_torque_enabled(True)
+        _setup_torque_free_active = False
+        _move_arm_then_base(
+            HOME_POSITION,
+            speed=HOME_MOVE_SPEED,
+            acc=HOME_MOVE_ACC,
+            lift_pose=HOME_POSITION,
+        )
+        _set_sts_torque_enabled(False)
+        _setup_torque_free_active = True
+        _set_gripper_setup_open_free()
+
         _setup_phase = "second_slot"
         _setup_phase_moved = False
+        _setup_anchor_pose = None
         _setup_prev_pose = None
-        _setup_stable_since = now
+        _setup_stable_since = time.time()
         _setup_movement_arm_ts = time.time() + SETUP_MOVEMENT_ARM_DELAY_SEC
-        core_matrix_set_setup_step(2)
+        _setup_blink_on = True
+        core_matrix_set_setup_step(3)  # S3 = move to second slot
         return
 
     if _setup_phase == "second_slot":
@@ -472,6 +567,7 @@ def _handle_setup_phase():
         _slot_grab_count = 0
         _setup_phase = "done"
         _setup_phase_moved = False
+        _setup_anchor_pose = None
         _set_sts_torque_enabled(True)
         _setup_torque_free_active = False
         print("[SETUP] Returning to HOME before idle.")
@@ -482,13 +578,15 @@ def _handle_setup_phase():
 
 
 def _set_state(new_state: str):
-    global _state, _setup_torque_free_active
+    global _state, _setup_torque_free_active, _detect_cooldown_until
     old_state = _state
     if old_state == STATE_SETUP and new_state != STATE_SETUP and _setup_torque_free_active:
         _set_sts_torque_enabled(True)
         _setup_torque_free_active = False
     with _state_lock:
         _state = new_state
+    if new_state == STATE_DETECT:
+        _detect_cooldown_until = time.time() + DETECT_COOLDOWN_SEC
     try:
         led_matrix_set_state_name(new_state)
     except Exception:
@@ -498,7 +596,9 @@ def _set_state(new_state: str):
 
 def _move_servo(angle: int):
     try:
-        Bridge.call("move_servo", angle)
+        res = _bridge_call_and_unwrap("move_servo", int(angle))
+        if res is None:
+            print(f"[StateMachine] move_servo({angle}): Bridge returned None")
     except Exception as e:
         print(f"[StateMachine] move_servo({angle}) error: {e}")
 
@@ -513,18 +613,17 @@ def _set_gripper_hold(hold: bool) -> bool:
 
 
 def _set_gripper_idle_closed_free():
-    # Idle policy: close gripper, then release torque so it is manually movable.
+    # Idle policy: close gripper and hold.
     _set_gripper_hold(True)
     _move_servo(GRIPPER_CLOSED_ANGLE)
     time.sleep(0.2)
-    _set_gripper_hold(False)
 
 
 def _set_gripper_setup_open_free():
     _set_gripper_hold(True)
     _move_servo(GRIPPER_SETUP_OPEN_ANGLE)
     time.sleep(0.2)
-    _set_gripper_hold(False)
+    # Keep holding throughout setup — grip is released when entering detect (idle worker)
 
 
 def _clamp_pos(v: int) -> int:
@@ -551,24 +650,6 @@ def _move_arm_to_home_position():
         sts_move_pos(sid, int(target), speed=HOME_MOVE_SPEED, acc=HOME_MOVE_ACC)
     time.sleep(HOME_SETTLE_SEC)
 
-
-def _move_base_then_arm(target_pose: dict[int, int], speed: int, acc: int) -> bool:
-    """Approach: rotate base first (id=1), then move arm joints (2..)."""
-    ok_all = True
-    base = target_pose.get(GRAB_BASE_SERVO_ID)
-    if base is not None:
-        ok_all = ok_all and sts_move_pos(GRAB_BASE_SERVO_ID, int(base), speed=int(speed), acc=int(acc))
-        time.sleep(0.35)
-    for sid in STS_SERVO_IDS:
-        if sid == GRAB_BASE_SERVO_ID:
-            continue
-        target = target_pose.get(sid)
-        if target is None:
-            ok_all = False
-            continue
-        ok_all = ok_all and sts_move_pos(sid, int(target), speed=int(speed), acc=int(acc))
-    time.sleep(HOME_SETTLE_SEC)
-    return ok_all
 
 
 def _move_arm_then_base(target_pose: dict[int, int], speed: int, acc: int, lift_pose: dict[int, int] | None = None) -> bool:
@@ -622,8 +703,9 @@ def _state_machine_worker():
         elif s == STATE_GRAB:
             with _state_lock:
                 _state = "grab_running"
-            # Side-effects for UI + LED matrix even while we keep the worker state in "grab_running".
+            # Ensure UI + LED matrix reflect grab state (socket + matrix).
             try:
+                ui.send_message("state", message={"state": STATE_GRAB})
                 led_matrix_set_state_name(STATE_GRAB)
             except Exception:
                 pass
@@ -664,42 +746,94 @@ def _state_machine_worker():
             offset = int(GRAB_BASE_OFFSET_STEP) * int(slot_idx) * int(GRAB_BASE_OFFSET_DIRECTION)
             target_pose[GRAB_BASE_SERVO_ID] = max(0, min(4095, base_raw + offset))
 
-            # Grab rules:
-            # - Approach (go take gadget): rotate base first, then lower arm.
-            # - Return (got gadget): lift arm first, then rotate base.
-            # - Keep gripper closed and holding torque until delivery pose.
+            # Grab approach:
+            # 1) Rotate base only toward slot
+            # 2) Partial descent (arm halfway)
+            # 3) Set narrow gripper opening
+            # 4) Full descent to slot
+            # 5) Close gripper max and hold tight
             _set_gripper_hold(True)
+
+            # Step 1: rotate base to face slot
+            base_target = target_pose.get(GRAB_BASE_SERVO_ID)
+            if base_target is not None:
+                sts_move_pos(GRAB_BASE_SERVO_ID, int(base_target), speed=GRAB_APPROACH_SPEED, acc=GRAB_APPROACH_ACC)
+            time.sleep(1.0)
+
+            # Step 2: partial descent — arm joints halfway between home and target
+            for sid in STS_SERVO_IDS:
+                if sid == GRAB_BASE_SERVO_ID:
+                    continue
+                home_val = int(HOME_POSITION.get(sid, 2048))
+                target_val = int(target_pose.get(sid, home_val))
+                mid = _clamp_pos(int(home_val + 0.5 * (target_val - home_val)))
+                sts_move_pos(sid, mid, speed=GRAB_APPROACH_SPEED, acc=GRAB_APPROACH_ACC)
+            time.sleep(0.8)
+
+            # Step 3: set narrow gripper opening
             _move_servo(GRIPPER_GRAB_PREOPEN_ANGLE)
-            time.sleep(GRAB_OPEN_WAIT_SEC)
-            _move_base_then_arm(target_pose, speed=GRAB_APPROACH_SPEED, acc=GRAB_APPROACH_ACC)
+            time.sleep(0.3)
+
+            # Step 4: full descent to slot position
+            for sid in STS_SERVO_IDS:
+                if sid == GRAB_BASE_SERVO_ID:
+                    continue
+                target = target_pose.get(sid)
+                if target is not None:
+                    sts_move_pos(sid, int(target), speed=GRAB_APPROACH_SPEED, acc=GRAB_APPROACH_ACC)
             time.sleep(GRAB_SETTLE_BEFORE_CLOSE_SEC)
+
             p_open = get_pressure()
             print(f"[GRAB][PRESSURE][open] A0={p_open.get('a0')} A1={p_open.get('a1')}")
-            _move_servo(GRIPPER_CLOSED_ANGLE)
+
+            # Step 5: close gripper fully and hold tight (retry — critical)
+            for _grip_try in range(3):
+                _move_servo(GRIPPER_CLOSED_ANGLE)
+                time.sleep(0.3)
             time.sleep(GRAB_CLOSE_WAIT_SEC)
             p_closed = get_pressure()
             print(f"[GRAB][PRESSURE][after_pick] A0={p_closed.get('a0')} A1={p_closed.get('a1')}")
             _move_arm_then_base(HOME_POSITION, speed=GRAB_RETURN_SPEED, acc=GRAB_RETURN_ACC, lift_pose=HOME_POSITION)
 
-            # Delivery: from HOME, without rotating base, reach forward and present gadget.
+            # Delivery: from HOME, reach forward and present gadget.
             delivery_pose = _get_delivery_pose()
             _move_arm_to_pose(delivery_pose, speed=DELIVERY_SPEED, acc=DELIVERY_ACC)
 
-            # Keep object clamped until delivery pose, then wait user pickup time.
-            time.sleep(GRAB_WAIT_BEFORE_HOME_SEC)
+            # Wait for a face to appear (user coming to take the pen).
+            _delivery_face_seen.clear()
+            with _state_lock:
+                _state = "delivery_waiting"
+            led_matrix_set_state_name(STATE_GRAB)  # keep grab eyes while waiting
+            print("[DELIVERY] Waiting for face to hand over pen...")
+
+            _delivery_face_seen.wait()  # blocks until face_detected() signals
+            print("[DELIVERY] Face detected! Showing heart eyes...")
+
+            # Heart eyes for 3 seconds, then release
+            led_matrix_set_state_name(STATE_DELIVERY)
+            time.sleep(DELIVERY_HEART_SEC)
+
+            # Release pen
             _move_servo(GRIPPER_OPEN_ANGLE)
             time.sleep(0.8)
             _move_servo(GRIPPER_CLOSED_ANGLE)
             time.sleep(0.6)
-            # Return arm back to HOME pose (no base rotation needed)
+
+            # Return to HOME
             _move_arm_to_pose(HOME_POSITION, speed=DELIVERY_SPEED, acc=DELIVERY_ACC)
             _slot_grab_count = (_slot_grab_count + 1) % GRAB_SLOT_COUNT_MAX
             print(f"[GRAB] completed slot #{_slot_grab_count if _slot_grab_count > 0 else GRAB_SLOT_COUNT_MAX}")
+
+            # Wait at home before returning to idle
+            print(f"[DELIVERY] Waiting {DELIVERY_POST_RELEASE_HOME_SEC}s before idle...")
+            time.sleep(DELIVERY_POST_RELEASE_HOME_SEC)
             _set_state(STATE_DETECT)
         elif s == STATE_RELEASE:
             with _state_lock:
                 _state = "release_running"
+            # Ensure UI + LED matrix reflect release state (socket + matrix).
             try:
+                ui.send_message("state", message={"state": STATE_RELEASE})
                 led_matrix_set_state_name(STATE_RELEASE)
             except Exception:
                 pass
@@ -761,6 +895,9 @@ def _idle_animation_worker():
 
         if s != STATE_DETECT:
             last_state = s
+            # In grab/release we don't need aggressive idle polling; reduce CPU noise
+            # to avoid starving other threads (e.g. websocket keepalive).
+            time.sleep(0.2)
             continue
 
         # Siamo entrati (o rientrati) nello stato detect: aggiorna le posizioni di base
@@ -829,11 +966,15 @@ def _idle_animation_worker():
 
 
 def face_detected():
-    """In detect state: transition to grab when a face is detected."""
+    """In detect state: transition to grab. In delivery state: signal face seen."""
     with _state_lock:
-        if _state != STATE_DETECT:
+        s = _state
+    if s == STATE_DETECT:
+        if time.time() < _detect_cooldown_until:
             return
-    _set_state(STATE_GRAB)
+        _set_state(STATE_GRAB)
+    elif s == STATE_DELIVERY or s == "delivery_waiting":
+        _delivery_face_seen.set()
 
 
 #
@@ -859,11 +1000,12 @@ def _state_for_ui() -> str:
     """Map internal machine state to user-facing state value."""
     runtime_map = {
         "grab_running": STATE_GRAB,
+        "delivery_waiting": STATE_DELIVERY,
         "release_running": STATE_RELEASE,
     }
     with _state_lock:
         s = _state
-    if s in (STATE_SETUP, STATE_DETECT, STATE_GRAB, STATE_RELEASE):
+    if s in (STATE_SETUP, STATE_DETECT, STATE_GRAB, STATE_DELIVERY, STATE_RELEASE):
         return s
     return runtime_map.get(s, STATE_DETECT)
 
@@ -910,17 +1052,21 @@ def clear_led_matrix():
 def _enter_setup_mode():
     global _setup_phase, _setup_prev_pose, _setup_stable_since, _setup_phase_moved, _setup_torque_free_active
     global FIRST_SLOT_POSITION, SECOND_SLOT_POSITION, _slot_grab_count
+    global _setup_last_blink_ts, _setup_blink_on, _setup_anchor_pose
     _setup_phase = "home"
     _setup_prev_pose = None
+    _setup_anchor_pose = None
     _setup_stable_since = time.time()
     _setup_phase_moved = False
+    _setup_last_blink_ts = 0.0
+    _setup_blink_on = True
     _set_sts_torque_enabled(False)
     _setup_torque_free_active = True
     FIRST_SLOT_POSITION = {}
     SECOND_SLOT_POSITION = {}
     _slot_grab_count = 0
     _set_state(STATE_SETUP)
-    core_matrix_set_setup_step(1)
+    core_matrix_set_setup_step(1)  # S1 = move to HOME
 
 
 def set_state_checkpoint(state=None):
@@ -1075,26 +1221,29 @@ def _bridge_call_and_unwrap(method: str, *args):
         )
         return any(m in msg for m in markers)
 
-    with _bridge_lock:
-        for attempt in range(BRIDGE_CALL_RETRIES):
+    for attempt in range(BRIDGE_CALL_RETRIES):
+        with _bridge_lock:
             try:
                 res = Bridge.call(method, *args)
                 if hasattr(res, "result"):
                     try:
-                        return res.result()
+                        return res.result(timeout=BRIDGE_RESULT_TIMEOUT_SEC)
                     except Exception as e:
                         msg = str(e)
                         if attempt < (BRIDGE_CALL_RETRIES - 1) and _is_transient_bridge_error(msg):
-                            time.sleep(BRIDGE_CALL_RETRY_DELAY_SEC)
-                            continue
-                        return None
-                return res
+                            pass  # will sleep outside the lock below
+                        else:
+                            return None
+                else:
+                    return res
             except Exception as e:
                 msg = str(e)
                 if attempt < (BRIDGE_CALL_RETRIES - 1) and _is_transient_bridge_error(msg):
-                    time.sleep(BRIDGE_CALL_RETRY_DELAY_SEC)
-                    continue
-                return None
+                    pass  # will sleep outside the lock below
+                else:
+                    return None
+        # Sleep OUTSIDE the lock so other threads are not blocked 30s during retries.
+        time.sleep(BRIDGE_CALL_RETRY_DELAY_SEC)
     return None
 
 
@@ -1118,6 +1267,15 @@ def core_matrix_set_setup_step(step: int) -> bool:
         return res is not None and int(res) > 0
     except Exception as e:
         print(f"[MATRIX] core_matrix_set_setup_step({step}) error: {e}")
+        return False
+
+
+def core_matrix_clear() -> bool:
+    """Clear the UNO Q onboard matrix (blank frame)."""
+    try:
+        res = _bridge_call_and_unwrap("core_matrix_clear")
+        return res is not None and int(res) > 0
+    except Exception:
         return False
 
 
@@ -1206,6 +1364,7 @@ def led_matrix_set_state_name(state_name: str) -> bool:
         STATE_DETECT: 0,
         STATE_GRAB: 1,
         STATE_RELEASE: 2,
+        STATE_DELIVERY: 4,
     }
     code = code_map.get(str(state_name).lower())
     if code is None:
@@ -1270,12 +1429,7 @@ def send_detections_to_ui(detections: dict):
 
 detection_stream.on_detect_all(send_detections_to_ui)
 
-# Initialize LED matrix (if present) with default state.
-try:
-    led_matrix_set_intensity(_led_matrix_intensity)
-    led_matrix_set_state_name(STATE_SETUP)
-except Exception:
-    pass
+# LED matrix init moved to _startup_sts_check (Bridge not ready before App.run).
 
 # Start workers after all symbols/functions are defined.
 threading.Thread(target=_state_machine_worker, daemon=True).start()
