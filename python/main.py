@@ -187,9 +187,6 @@ RELEASE_OPEN_WAIT_SEC = 3.0
 DELIVERY_HEART_SEC = 3.0  # show heart eyes then release pen
 DELIVERY_POST_RELEASE_HOME_SEC = 5.0  # wait at home before returning to idle
 
-# Delivery pose (RAM-only). If not set, computed as HOME + DELIVERY_DELTAS (no base rotation).
-DELIVERY_POSITION: dict[int, int] = {}
-DELIVERY_DELTAS = {2: 120, 3: -120, 4: 0}
 DELIVERY_SPEED = 650
 DELIVERY_ACC = 18
 
@@ -630,16 +627,6 @@ def _clamp_pos(v: int) -> int:
     return max(0, min(4095, int(v)))
 
 
-def _get_delivery_pose() -> dict[int, int]:
-    if DELIVERY_POSITION:
-        return dict(DELIVERY_POSITION)
-    pose = dict(HOME_POSITION)
-    for sid, delta in DELIVERY_DELTAS.items():
-        pose[sid] = _clamp_pos(int(pose.get(sid, 2048)) + int(delta))
-    # Do NOT rotate base for delivery
-    pose[GRAB_BASE_SERVO_ID] = int(HOME_POSITION.get(GRAB_BASE_SERVO_ID, pose.get(GRAB_BASE_SERVO_ID, 2048)))
-    return pose
-
 
 def _move_arm_to_home_position():
     """Muove tutti i servo STS verso la home prima del ritorno a idle."""
@@ -795,11 +782,7 @@ def _state_machine_worker():
             print(f"[GRAB][PRESSURE][after_pick] A0={p_closed.get('a0')} A1={p_closed.get('a1')}")
             _move_arm_then_base(HOME_POSITION, speed=GRAB_RETURN_SPEED, acc=GRAB_RETURN_ACC, lift_pose=HOME_POSITION)
 
-            # Delivery: from HOME, reach forward and present gadget.
-            delivery_pose = _get_delivery_pose()
-            _move_arm_to_pose(delivery_pose, speed=DELIVERY_SPEED, acc=DELIVERY_ACC)
-
-            # Wait for a face to appear (user coming to take the pen).
+            # Wait at HOME for a face to appear (user coming to take the pen).
             _delivery_face_seen.clear()
             with _state_lock:
                 _state = "delivery_waiting"
@@ -809,7 +792,7 @@ def _state_machine_worker():
             _delivery_face_seen.wait()  # blocks until face_detected() signals
             print("[DELIVERY] Face detected! Showing heart eyes...")
 
-            # Heart eyes for 3 seconds, then release
+            # Heart eyes — stay in place (user is already holding the pen)
             led_matrix_set_state_name(STATE_DELIVERY)
             time.sleep(DELIVERY_HEART_SEC)
 

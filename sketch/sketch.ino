@@ -125,17 +125,15 @@ static void _head_draw_eyes_release() {
 static void _head_draw_eyes_heart() {
   // Heart-shaped eyes on 12x8 matrix.
   // Left heart (cols 0-4, rows 0-7)
-  _head_point(1, 1); _head_point(2, 0); _head_point(3, 1);
+  _head_point(0, 0); _head_point(1, 0); _head_point(3, 0); _head_point(4, 0);
   _head_point(0, 2); _head_point(1, 2); _head_point(2, 2); _head_point(3, 2); _head_point(4, 2);
-  _head_point(0, 3); _head_point(1, 3); _head_point(2, 3); _head_point(3, 3); _head_point(4, 3);
-  _head_point(1, 4); _head_point(2, 4); _head_point(3, 4);
-  _head_point(2, 5);
+  _head_point(1, 3); _head_point(2, 3); _head_point(3, 3);
+  _head_point(2, 4);
   // Right heart (cols 7-11, rows 0-7)
-  _head_point(8, 1); _head_point(9, 0); _head_point(10, 1);
+  _head_point(7, 0); _head_point(8, 0); _head_point(10, 0); _head_point(11, 0);
   _head_point(7, 2); _head_point(8, 2); _head_point(9, 2); _head_point(10, 2); _head_point(11, 2);
-  _head_point(7, 3); _head_point(8, 3); _head_point(9, 3); _head_point(10, 3); _head_point(11, 3);
-  _head_point(8, 4); _head_point(9, 4); _head_point(10, 4);
-  _head_point(9, 5);
+  _head_point(8, 3); _head_point(9, 3); _head_point(10, 3);
+  _head_point(9, 4);
 }
 
 static void _head_render_state(int state_code, bool blink_closed) {
