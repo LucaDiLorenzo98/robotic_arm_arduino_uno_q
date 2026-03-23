@@ -140,8 +140,7 @@ def _startup_sts_check():
         # Clear indication: now it's safe to start setup and move the robot by hand.
         core_matrix_set_setup_step(1)
         print("[SETUP] Move robot to HOME, then hold still 5s.")
-        print("[SETUP] Then move robot to FIRST_SLOT, then hold still 5s.")
-        print("[SETUP] Then move robot to SECOND_SLOT, then hold still 5s.")
+        print(f"[SETUP] Then move robot to each of the {GRAB_SLOT_COUNT_MAX} slots, holding still 5s each.")
         # Ready for setup: nod + open gripper slightly
         _set_sts_torque_enabled(True)
         _setup_nod_servo4()
@@ -202,10 +201,8 @@ HOME_MOVE_SPEED = 900
 HOME_MOVE_ACC = 30
 HOME_SETTLE_SEC = 1.2
 
-# Primo slot (RAM-only session)
-FIRST_SLOT_POSITION: dict[int, int] = {}
-# Secondo slot (RAM-only session): usato per calcolare offset tra slot.
-SECOND_SLOT_POSITION: dict[int, int] = {}
+# Posizioni di tutti gli slot (RAM-only session, catturate durante setup).
+SLOT_POSITIONS: list[dict[int, int]] = []
 
 # Setup automatico: fermo per N secondi -> salva posizione.
 SETUP_STABLE_SECONDS = 5.0
@@ -222,11 +219,8 @@ SETUP_NOD_ACC = 20
 SETUP_NOD_DELAY_SEC = 0.30
 SETUP_BLINK_INTERVAL_SEC = 0.5  # blink period during "hold still" countdown
 
-# Grab sequenziale su 9 slot con offset base servo1 configurabile.
+# Numero di slot da catturare durante il setup.
 GRAB_SLOT_COUNT_MAX = 9
-GRAB_BASE_SERVO_ID = 1
-GRAB_BASE_OFFSET_STEP = 300
-GRAB_BASE_OFFSET_DIRECTION = -1  # +1 o -1
 
 # Web UI disabilitata: manteniamo solo face detection + logica robot.
 ui = None
@@ -234,7 +228,7 @@ detection_stream = VideoObjectDetection(confidence=0.85, debounce_sec=0.0)
 
 _state = STATE_SETUP
 _state_lock = threading.Lock()
-_setup_phase = "home"  # home -> first_slot -> second_slot -> done
+_setup_phase = "home"  # home -> slot_1 -> slot_2 -> ... -> slot_9 -> done
 _setup_prev_pose: dict[int, int] | None = None
 _setup_stable_since = 0.0
 _setup_phase_moved = False  # diventa True quando rileva movimento manuale nella fase corrente
@@ -244,7 +238,6 @@ _setup_pose_fail_streak = 0
 _setup_last_blink_ts = 0.0
 _setup_blink_on = True
 _slot_grab_count = 0
-_grab_offset_warn_ts = 0.0
 _setup_movement_arm_ts = 0.0
 
 # Cooldown: after setup→detect, ignore face detections for a few seconds
@@ -399,13 +392,11 @@ def _pose_has_movement(pose_a: dict[int, int], pose_b: dict[int, int], threshold
 
 
 def _setup_current_step_number() -> int:
-    """Map setup phase to display step: S1=HOME, S2=FIRST_SLOT, S3=SECOND_SLOT."""
+    """Map setup phase to display step: S1=HOME, S2=slot (any), S3=done."""
     if _setup_phase == "home":
         return 1
-    if _setup_phase == "first_slot":
+    if _setup_phase.startswith("slot_"):
         return 2
-    if _setup_phase == "second_slot":
-        return 3
     return 1
 
 
@@ -425,12 +416,11 @@ def _setup_nod_servo4():
 
 
 def _handle_setup_phase():
-    """Auto setup: hold still 5s to capture HOME, FIRST_SLOT, SECOND_SLOT."""
+    """Auto setup: hold still 5s to capture HOME, then each of the 9 slots."""
     global _setup_prev_pose, _setup_stable_since, _setup_phase, _setup_phase_moved, _setup_torque_free_active
     global _setup_pose_fail_streak, _setup_last_blink_ts, _setup_blink_on
     global _setup_movement_arm_ts
-    global HOME_POSITION, FIRST_SLOT_POSITION, SECOND_SLOT_POSITION, _slot_grab_count
-    global GRAB_BASE_OFFSET_STEP, GRAB_BASE_OFFSET_DIRECTION
+    global HOME_POSITION, SLOT_POSITIONS, _slot_grab_count
     now = time.time()
     if not _setup_torque_free_active:
         _set_sts_torque_enabled(False)
@@ -508,70 +498,60 @@ def _handle_setup_phase():
         _set_sts_torque_enabled(False)
         _setup_torque_free_active = True
         _setup_movement_arm_ts = time.time() + SETUP_MOVEMENT_ARM_DELAY_SEC
-        _setup_phase = "first_slot"
+        SLOT_POSITIONS = []
+        _setup_phase = "slot_1"
         _setup_phase_moved = False
         _setup_anchor_pose = None
         _setup_prev_pose = None
         _setup_stable_since = now
         _setup_blink_on = True
-        core_matrix_set_setup_step(2)  # S2 = move to first slot
+        core_matrix_set_setup_step(2)
+        print(f"[SETUP] Now move arm to slot 1/{GRAB_SLOT_COUNT_MAX}, then hold still {SETUP_STABLE_SECONDS:.0f}s.")
         return
 
-    if _setup_phase == "first_slot":
-        FIRST_SLOT_POSITION = dict(pose)
-        print(f"[SETUP] FIRST_SLOT captured: {FIRST_SLOT_POSITION}")
+    # Generic slot capture: slot_1 .. slot_N
+    if _setup_phase.startswith("slot_"):
+        slot_num = int(_setup_phase.split("_")[1])
+        SLOT_POSITIONS.append(dict(pose))
+        print(f"[SETUP] SLOT {slot_num}/{GRAB_SLOT_COUNT_MAX} captured: {pose}")
 
-        # Return to HOME between slot captures so the user can position
-        # the arm consistently for SECOND_SLOT.
-        _set_sts_torque_enabled(True)
-        _setup_torque_free_active = False
-        _move_arm_then_base(
-            HOME_POSITION,
-            speed=HOME_MOVE_SPEED,
-            acc=HOME_MOVE_ACC,
-            lift_pose=HOME_POSITION,
-        )
-        _set_sts_torque_enabled(False)
-        _setup_torque_free_active = True
-        _set_gripper_setup_open_free()
+        if slot_num < GRAB_SLOT_COUNT_MAX:
+            # Return to HOME between slot captures
+            _set_sts_torque_enabled(True)
+            _setup_torque_free_active = False
+            _move_arm_then_base(
+                HOME_POSITION,
+                speed=HOME_MOVE_SPEED,
+                acc=HOME_MOVE_ACC,
+                lift_pose=HOME_POSITION,
+            )
+            _setup_nod_servo4()
+            _set_sts_torque_enabled(False)
+            _setup_torque_free_active = True
+            _set_gripper_setup_open_free()
 
-        _setup_phase = "second_slot"
-        _setup_phase_moved = False
-        _setup_anchor_pose = None
-        _setup_prev_pose = None
-        _setup_stable_since = time.time()
-        _setup_movement_arm_ts = time.time() + SETUP_MOVEMENT_ARM_DELAY_SEC
-        _setup_blink_on = True
-        core_matrix_set_setup_step(3)  # S3 = move to second slot
-        return
-
-    if _setup_phase == "second_slot":
-        SECOND_SLOT_POSITION = dict(pose)
-        print(f"[SETUP] SECOND_SLOT captured: {SECOND_SLOT_POSITION}")
-
-        # Auto-calc offset from FIRST_SLOT -> SECOND_SLOT on base servo.
-        first_base = int(FIRST_SLOT_POSITION.get(GRAB_BASE_SERVO_ID, 0))
-        second_base = int(SECOND_SLOT_POSITION.get(GRAB_BASE_SERVO_ID, first_base))
-        delta = second_base - first_base
-        if delta != 0:
-            GRAB_BASE_OFFSET_DIRECTION = 1 if delta > 0 else -1
-            GRAB_BASE_OFFSET_STEP = abs(delta)
-        print(
-            "[SETUP] slot offset updated: "
-            f"step={GRAB_BASE_OFFSET_STEP}, direction={GRAB_BASE_OFFSET_DIRECTION}, delta={delta}"
-        )
-
-        _slot_grab_count = 0
-        _setup_phase = "done"
-        _setup_phase_moved = False
-        _setup_anchor_pose = None
-        _set_sts_torque_enabled(True)
-        _setup_torque_free_active = False
-        print("[SETUP] Returning to HOME before idle.")
-        # Return rule: lift arm first, then rotate base.
-        _move_arm_then_base(HOME_POSITION, speed=HOME_MOVE_SPEED, acc=HOME_MOVE_ACC, lift_pose=HOME_POSITION)
-        core_matrix_set_setup_step(3)
-        _set_state(STATE_DETECT)
+            next_slot = slot_num + 1
+            _setup_phase = f"slot_{next_slot}"
+            _setup_phase_moved = False
+            _setup_anchor_pose = None
+            _setup_prev_pose = None
+            _setup_stable_since = time.time()
+            _setup_movement_arm_ts = time.time() + SETUP_MOVEMENT_ARM_DELAY_SEC
+            _setup_blink_on = True
+            core_matrix_set_setup_step(2)
+            print(f"[SETUP] Now move arm to slot {next_slot}/{GRAB_SLOT_COUNT_MAX}, then hold still {SETUP_STABLE_SECONDS:.0f}s.")
+        else:
+            # All slots captured — done
+            _slot_grab_count = 0
+            _setup_phase = "done"
+            _setup_phase_moved = False
+            _setup_anchor_pose = None
+            _set_sts_torque_enabled(True)
+            _setup_torque_free_active = False
+            print(f"[SETUP] All {GRAB_SLOT_COUNT_MAX} slots captured. Returning to HOME.")
+            _move_arm_then_base(HOME_POSITION, speed=HOME_MOVE_SPEED, acc=HOME_MOVE_ACC, lift_pose=HOME_POSITION)
+            core_matrix_set_setup_step(3)
+            _set_state(STATE_DETECT)
 
 
 def _set_state(new_state: str):
@@ -640,12 +620,18 @@ def _move_arm_to_home_position():
 
 
 def _move_arm_then_base(target_pose: dict[int, int], speed: int, acc: int, lift_pose: dict[int, int] | None = None) -> bool:
-    """Return: lift arm joints first (2..), then rotate base (id=1)."""
+    """Lift arm straight (2+3 together), then remaining joints (4), then rotate base (1)."""
     ok_all = True
-    # Lift/position arm joints first (keep base unchanged here)
     src = lift_pose if lift_pose is not None else target_pose
+    # Step 1: move servo 2 (lift) and 3 (fold) together so the arm goes straight up
+    for sid in (2, 3):
+        target = src.get(sid)
+        if target is not None:
+            ok_all = ok_all and sts_move_pos(sid, int(target), speed=int(speed), acc=int(acc))
+    time.sleep(0.6)
+    # Step 2: move remaining arm joints (4)
     for sid in STS_SERVO_IDS:
-        if sid == GRAB_BASE_SERVO_ID:
+        if sid in (1, 2, 3):
             continue
         target = src.get(sid)
         if target is None:
@@ -653,10 +639,10 @@ def _move_arm_then_base(target_pose: dict[int, int], speed: int, acc: int, lift_
             continue
         ok_all = ok_all and sts_move_pos(sid, int(target), speed=int(speed), acc=int(acc))
     time.sleep(0.35)
-    # Then rotate base
-    base = target_pose.get(GRAB_BASE_SERVO_ID)
+    # Step 3: rotate base
+    base = target_pose.get(1)
     if base is not None:
-        ok_all = ok_all and sts_move_pos(GRAB_BASE_SERVO_ID, int(base), speed=int(speed), acc=int(acc))
+        ok_all = ok_all and sts_move_pos(1, int(base), speed=int(speed), acc=int(acc))
     time.sleep(HOME_SETTLE_SEC)
     return ok_all
 
@@ -677,7 +663,7 @@ def _move_arm_to_pose(target_pose: dict[int, int], speed: int = HOME_MOVE_SPEED,
 
 def _state_machine_worker():
     """Runs grab and release sequences with timed waits."""
-    global _state, _slot_grab_count, _grab_offset_warn_ts
+    global _state, _slot_grab_count
     while True:
         time.sleep(0.08)
         with _state_lock:
@@ -696,42 +682,15 @@ def _state_machine_worker():
                 led_matrix_set_state_name(STATE_GRAB)
             except Exception:
                 pass
-            if not FIRST_SLOT_POSITION:
-                print("[GRAB] First slot not configured yet.")
+            if not SLOT_POSITIONS:
+                print("[GRAB] Slots not configured yet.")
                 core_matrix_set_error_code(ERR_GRAB_SLOT_NOT_CONFIGURED)
                 _set_state(STATE_SETUP)
                 continue
 
-            slot_idx = _slot_grab_count % GRAB_SLOT_COUNT_MAX
-            target_pose = dict(FIRST_SLOT_POSITION)
-            base_raw = int(target_pose.get(GRAB_BASE_SERVO_ID, 2048))
-
-            # Warn if default base offset likely causes clamping/duplicates.
-            now_ts = time.time()
-            if now_ts - _grab_offset_warn_ts > 20.0:
-                positions = []
-                clamped_low = 0
-                clamped_high = 0
-                for i in range(GRAB_SLOT_COUNT_MAX):
-                    v = base_raw + int(GRAB_BASE_OFFSET_STEP) * int(i) * int(GRAB_BASE_OFFSET_DIRECTION)
-                    v = max(0, min(4095, v))
-                    if v == 0:
-                        clamped_low += 1
-                    if v == 4095:
-                        clamped_high += 1
-                    positions.append(v)
-                unique_count = len(set(positions))
-                if unique_count < GRAB_SLOT_COUNT_MAX or clamped_low or clamped_high:
-                    print(
-                        "[GRAB][WARN] base offset might be too aggressive: "
-                        f"unique_positions={unique_count}/{GRAB_SLOT_COUNT_MAX}, "
-                        f"clamped_low={clamped_low}, clamped_high={clamped_high}. "
-                        "Consider lowering GRAB_BASE_OFFSET_STEP or adjusting direction."
-                    )
-                    _grab_offset_warn_ts = now_ts
-
-            offset = int(GRAB_BASE_OFFSET_STEP) * int(slot_idx) * int(GRAB_BASE_OFFSET_DIRECTION)
-            target_pose[GRAB_BASE_SERVO_ID] = max(0, min(4095, base_raw + offset))
+            slot_idx = _slot_grab_count % len(SLOT_POSITIONS)
+            target_pose = dict(SLOT_POSITIONS[slot_idx])
+            print(f"[GRAB] Slot {slot_idx + 1}/{len(SLOT_POSITIONS)}: target={target_pose}")
 
             # Grab approach:
             # 1) Rotate base only toward slot
@@ -740,16 +699,17 @@ def _state_machine_worker():
             # 4) Full descent to slot
             # 5) Close gripper max and hold tight
             _set_gripper_hold(True)
+            BASE_SERVO_ID = 1
 
             # Step 1: rotate base to face slot
-            base_target = target_pose.get(GRAB_BASE_SERVO_ID)
+            base_target = target_pose.get(BASE_SERVO_ID)
             if base_target is not None:
-                sts_move_pos(GRAB_BASE_SERVO_ID, int(base_target), speed=GRAB_APPROACH_SPEED, acc=GRAB_APPROACH_ACC)
+                sts_move_pos(BASE_SERVO_ID, int(base_target), speed=GRAB_APPROACH_SPEED, acc=GRAB_APPROACH_ACC)
             time.sleep(1.0)
 
             # Step 2: partial descent — arm joints halfway between home and target
             for sid in STS_SERVO_IDS:
-                if sid == GRAB_BASE_SERVO_ID:
+                if sid == BASE_SERVO_ID:
                     continue
                 home_val = int(HOME_POSITION.get(sid, 2048))
                 target_val = int(target_pose.get(sid, home_val))
@@ -763,7 +723,7 @@ def _state_machine_worker():
 
             # Step 4: full descent to slot position
             for sid in STS_SERVO_IDS:
-                if sid == GRAB_BASE_SERVO_ID:
+                if sid == BASE_SERVO_ID:
                     continue
                 target = target_pose.get(sid)
                 if target is not None:
@@ -804,8 +764,8 @@ def _state_machine_worker():
 
             # Return to HOME
             _move_arm_to_pose(HOME_POSITION, speed=DELIVERY_SPEED, acc=DELIVERY_ACC)
-            _slot_grab_count = (_slot_grab_count + 1) % GRAB_SLOT_COUNT_MAX
-            print(f"[GRAB] completed slot #{_slot_grab_count if _slot_grab_count > 0 else GRAB_SLOT_COUNT_MAX}")
+            _slot_grab_count = (_slot_grab_count + 1) % len(SLOT_POSITIONS)
+            print(f"[GRAB] completed slot {slot_idx + 1}/{len(SLOT_POSITIONS)}")
 
             # Wait at home before returning to idle
             print(f"[DELIVERY] Waiting {DELIVERY_POST_RELEASE_HOME_SEC}s before idle...")
@@ -1034,7 +994,7 @@ def clear_led_matrix():
 
 def _enter_setup_mode():
     global _setup_phase, _setup_prev_pose, _setup_stable_since, _setup_phase_moved, _setup_torque_free_active
-    global FIRST_SLOT_POSITION, SECOND_SLOT_POSITION, _slot_grab_count
+    global SLOT_POSITIONS, _slot_grab_count
     global _setup_last_blink_ts, _setup_blink_on, _setup_anchor_pose
     _setup_phase = "home"
     _setup_prev_pose = None
@@ -1045,8 +1005,7 @@ def _enter_setup_mode():
     _setup_blink_on = True
     _set_sts_torque_enabled(False)
     _setup_torque_free_active = True
-    FIRST_SLOT_POSITION = {}
-    SECOND_SLOT_POSITION = {}
+    SLOT_POSITIONS = []
     _slot_grab_count = 0
     _set_state(STATE_SETUP)
     core_matrix_set_setup_step(1)  # S1 = move to HOME
@@ -1096,18 +1055,6 @@ def set_home_current():
     return {"ok": True, "home": payload}
 
 
-def set_first_slot_current():
-    """GET /api/set_first_slot_current: salva in RAM la posa corrente del primo slot."""
-    global FIRST_SLOT_POSITION
-    valid = _capture_current_pose()
-    if not valid:
-        return {"ok": False, "error": "current servo pose unavailable or invalid"}
-
-    FIRST_SLOT_POSITION = dict(valid)
-    payload = _pose_payload(FIRST_SLOT_POSITION)
-    return {"ok": True, "first_slot": payload}
-
-
 def go_to_home():
     """GET /api/go_home: move robot arm to persisted HOME_POSITION."""
     _pause_idle_temporarily()
@@ -1115,41 +1062,27 @@ def go_to_home():
     return {"ok": ok, "home": _pose_payload(HOME_POSITION)}
 
 
-def go_to_first_slot():
-    """GET /api/go_first_slot: move robot arm to FIRST_SLOT_POSITION stored in RAM."""
-    if not FIRST_SLOT_POSITION:
-        return {"ok": False, "error": "first slot not saved yet"}
-    _pause_idle_temporarily()
-    ok = _move_arm_to_pose(FIRST_SLOT_POSITION)
-    return {"ok": ok, "first_slot": _pose_payload(FIRST_SLOT_POSITION)}
-
-
-def grab_offset_config(step=None, direction=None):
-    """GET /api/grab_offset_config?step=55&direction=1 (direction: 1 or -1)."""
-    global GRAB_BASE_OFFSET_STEP, GRAB_BASE_OFFSET_DIRECTION
+def go_to_slot(slot_idx=None):
+    """GET /api/go_slot?slot=0: move robot arm to a captured slot position."""
     try:
-        q_step = _get_request_arg("step", step)
-        q_dir = _get_request_arg("direction", direction)
-        if q_step is not None:
-            q_step = int(q_step)
-            if q_step < 0 or q_step > 500:
-                return {"ok": False, "error": "step must be 0..500"}
-            GRAB_BASE_OFFSET_STEP = q_step
-        if q_dir is not None:
-            q_dir = int(q_dir)
-            if q_dir not in (-1, 1):
-                return {"ok": False, "error": "direction must be -1 or 1"}
-            GRAB_BASE_OFFSET_DIRECTION = q_dir
+        idx = int(_get_request_arg("slot", slot_idx) or 0)
+    except (TypeError, ValueError):
+        return {"ok": False, "error": "slot index required (0-based)"}
+    if not SLOT_POSITIONS or idx < 0 or idx >= len(SLOT_POSITIONS):
+        return {"ok": False, "error": f"slot {idx} not available (have {len(SLOT_POSITIONS)})"}
+    _pause_idle_temporarily()
+    ok = _move_arm_to_pose(SLOT_POSITIONS[idx])
+    return {"ok": ok, "slot": idx, "pose": _pose_payload(SLOT_POSITIONS[idx])}
 
-        return {
-            "ok": True,
-            "step": int(GRAB_BASE_OFFSET_STEP),
-            "direction": int(GRAB_BASE_OFFSET_DIRECTION),
-            "slot_count": int(_slot_grab_count),
-            "slot_max": int(GRAB_SLOT_COUNT_MAX),
-        }
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
+
+def grab_slot_info():
+    """GET /api/grab_slot_info: return current slot status."""
+    return {
+        "ok": True,
+        "slot_count": int(_slot_grab_count),
+        "slot_max": len(SLOT_POSITIONS),
+        "slots_configured": len(SLOT_POSITIONS),
+    }
 
 
 def servo_move(id=None, position=None):
