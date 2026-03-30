@@ -1,9 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "WebFetch(domain:blog.arduino.cc)",
-      "WebFetch(domain:www.arduino.cc)",
-      "WebFetch(domain:store.arduino.cc)"
-    ]
-  }
-}
