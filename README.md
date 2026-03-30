@@ -14,8 +14,6 @@ A robot arm that recognizes people and delivers gadgets to them — no buttons, 
   </a>
 </div>
 
-> Replace `VIDEO_ID` with your YouTube video ID
-
 ---
 
 ## Required Hardware
