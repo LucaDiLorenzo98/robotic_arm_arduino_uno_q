@@ -6,146 +6,196 @@ A robot arm that recognizes people and delivers gadgets to them — no buttons, 
 
 ---
 
-## Hardware necessario
+## Assembly Tutorial
 
-| Componente | Dettagli |
+<div align="center">
+  <a href="https://www.youtube.com/watch?v=VIDEO_ID" target="_blank">
+    <img src="https://img.youtube.com/vi/VIDEO_ID/maxresdefault.jpg" alt="Assembly Tutorial" width="640" height="360">
+  </a>
+</div>
+
+> Replace `VIDEO_ID` with your YouTube video ID
+
+---
+
+## Required Hardware
+
+| Component | Details |
 |---|---|
-| **Arduino UNO Q** | Board principale (MPU + MCU, onboard LED matrix 8×13) |
-| **4× servo STS3215** | Bus seriale half-duplex, IDs 1–4 |
-| **Servo PWM standard** | Gripper su pin digitale **D9** |
-| **2× sensore di pressione** | Analogici su **A0** e **A1** |
-| **Modulino LED Matrix** | Display "testa" 12×8 (opzionale ma consigliato) |
-| **Adattatore half-duplex** | Per collegare i STS3215 alla porta Serial dell'UNO Q |
+| **Arduino UNO Q** | Main board (MPU + MCU, onboard LED matrix 8×13) |
+| **4× servo STS3215** | Half-duplex serial bus, IDs 1–4 |
+| **Standard PWM servo** | Gripper on digital pin **D9** |
+| **2× pressure sensor** | Analog on **A0** and **A1** |
+| **Modulino LED Matrix** | Head display 12×8 (optional but recommended) |
+| **Half-duplex adapter** | To connect STS3215 to UNO Q Serial port |
 
-### Schema pin
+### Pin Scheme
 
 ```
-D9         → segnale servo gripper (PWM)
-A0         → sensore pressione 1
-A1         → sensore pressione 2
-Serial     → bus STS3215 (1 Mbit/s, half-duplex)
-I2C (SDA/SCL) → Modulino LED Matrix (testa)
+D9         → gripper servo signal (PWM)
+A0         → pressure sensor 1
+A1         → pressure sensor 2
+Serial     → STS3215 bus (1 Mbit/s, half-duplex)
+I2C (SDA/SCL) → Modulino LED Matrix (head)
 ```
 
 ---
 
-## Librerie Arduino da installare
+## Bill of Materials (Non-Printed Components)
 
-Apri **Tools → Manage Libraries** in Arduino IDE / Arduino Lab e installa:
-
-| Libreria | Versione minima | Note |
+| Component | Qty | Link |
 |---|---|---|
-| `Arduino_RouterBridge` | ultima | Bridge MCU↔MPU |
-| `SCServo` | ultima | Controllo STS3215 |
-| `Arduino_LED_Matrix` | ultima | Matrice onboard UNO Q |
-| `ArduinoGraphics` | ultima | Dipendenza di LED Matrix |
-| `Modulino` oppure `Arduino_Modulino` | ultima | Per la testa LED (opzionale) |
+| Arduino UNO Q 4GB RAM | 1 | [Buy on Arduino Store](https://store.arduino.cc/products/uno-q-4gb?variant=56485750473079) |
+| Modulino LED Matrix | 1 | [Buy on Arduino Store USA](https://store-usa.arduino.cc/products/modulino-led-matrix?srsltid=AfmBOor0GNZJKd0D2jL9f3H0CvfEBB8TRz-Tk1juMp406W2SSdXQ8VzM) |
+| Feetech Digital STS3215 Servo Motors | 4 | [Buy on AliExpress](https://it.aliexpress.com/item/1005009271910382.html?spm=a2g0o.order_list.order_list_main.122.6c1d3696TBFRL9&gatewayAdapt=glo2ita) |
+| Waveshare Serial Bus Servo Driver Board | 1 | [Buy on Amazon](https://www.amazon.it/dp/B0CJ6TP3TP?ref=ppx_yo2ov_dt_b_fed_asin_title) |
+| Ball Bearing | 1 | [Buy on AliExpress](https://it.aliexpress.com/item/1005009736872307.html?spm=a2g0o.order_list.order_list_main.74.6c1d3696TBFRL9&gatewayAdapt=glo2ita) |
+| Pressure Sensors | 2 | [Buy on AliExpress](https://it.aliexpress.com/item/1005009958997279.html?spm=a2g0o.order_list.order_list_main.36.6c1d3696TBFRL9&gatewayAdapt=glo2ita) |
+| 12V 10A Power Supply | 1 | [Buy on Amazon](https://www.amazon.it/dp/B0D1VHNF9R?ref=ppx_yo2ov_dt_b_fed_asin_title) |
+| Lemorele USB-C Docking Station | 1 | [Buy on Amazon](https://www.amazon.it/dp/B08GM2H1Q2?ref=ppx_yo2ov_dt_b_fed_asin_title&th=1) |
+| Micro Servo Metal Gear 90° | 1 | [Buy on Amazon](https://www.amazon.it/dp/B0C38H8TBY?ref=ppx_yo2ov_dt_b_fed_asin_title&th=1) |
+| M3 Screws | Various | Common hardware store |
+| Power Supply Wires | As needed | Common hardware store |
+| Power Cable 18/16 AWG | 1 roll | Common hardware store |
+| Circular Power Connector | 1 | Common electronics store |
+| Circular Switch 2-Pin | 1 | Common electronics store |
+| Threaded Inserts (3×4, 5×5 mm) | Set | [Buy on AliExpress](https://it.aliexpress.com/w/wholesale-threaded-inserts-m3.html) |
 
 ---
 
-## Dipendenze Python
+## 3D Files and Printing
 
-Il progetto gira sul lato MPU (Linux) dell'UNO Q tramite l'ambiente Arduino Python. Non occorre installare nulla manualmente: le dipendenze (`arduino.app_utils`, `arduino.app_bricks.video_objectdetection`) fanno parte dell'SDK Arduino.
+3D files are available in the **`3d_models/`** folder:
 
-Le sole librerie standard usate sono: `datetime`, `time`, `threading`, `math`, `os`, `sys`, `functools`.
+- **`models.3mf`** – Complete project with all components **already oriented and ready to print** (recommended)
+- **Individual STL files** – For those who prefer manual slicing
 
----
+### Recommended Materials
 
-## Come caricare e avviare
-
-1. Apri **Arduino Lab** (o Arduino IDE con supporto UNO Q).
-2. Carica lo sketch `sketch/sketch.ino` sulla board.
-3. L'app Python `python/main.py` viene avviata automaticamente dall'ambiente Arduino sul lato MPU.
-4. I log in tempo reale vengono scritti anche su `python/robot.log` (con timestamp).
-
----
-
-## Setup del robot (prima accensione o reset)
-
-All'avvio il robot entra automaticamente in **modalità setup**. La matrice onboard mostra il passo corrente (**S1**, **S2**, **S3**).
-
-Il torque dei servo STS3215 viene **disabilitato**: puoi muovere il braccio liberamente a mano.
-
-### Passo S1 – Posizione HOME
-
-1. Muovi il braccio a mano nella posizione HOME (in piedi, centrato).
-2. Tienilo fermo per **5 secondi** → la matrice lampeggia il numero del passo durante il conto.
-3. Quando catturata, il robot fa un "cenno" con il servo 4 per confermare, poi passa a S2.
-
-### Passo S2 – Posizioni Slot (fino a 9)
-
-1. Muovi il braccio verso il **primo slot** (dove si trovano le penne).
-2. Tienilo fermo per **5 secondi** → slot catturato, il robot torna a HOME e fa il cenno.
-3. Ripeti per ogni slot successivo (fino a un massimo di **9 slot**).
-4. Dopo l'ultimo slot, il robot torna a HOME e mostra **S3** → setup completo.
-
-> Il sistema ignora piccole vibrazioni e microaggiustamenti: attende un vero movimento manuale prima di iniziare il conto.
-
-### Passo S3 – Setup completato
-
-Il robot entra nello stato **detect** ed è operativo.
+| Component | Material | Notes |
+|---|---|---|
+| Arm structure, base, covers | **PETG HF** | Resistant, good rigidity, high temperatures |
+| Flexible joints, shock absorbers | **TPU 95A** | Elastic, shock-absorbing, suitable for repeated movements |
 
 ---
 
-## Funzionamento normale
+## Arduino Libraries to Install
+
+Open **Tools → Manage Libraries** in Arduino IDE / Arduino Lab and install:
+
+| Library | Min version | Notes |
+|---|---|---|
+| `Arduino_RouterBridge` | latest | Bridge MCU↔MPU |
+| `SCServo` | latest | STS3215 control |
+| `Arduino_LED_Matrix` | latest | Onboard UNO Q matrix |
+| `ArduinoGraphics` | latest | LED Matrix dependency |
+| `Modulino` or `Arduino_Modulino` | latest | For LED head (optional) |
+
+---
+
+## Python Dependencies
+
+The project runs on the MPU (Linux) side of UNO Q via Arduino Python environment. No manual installation required: the dependencies (`arduino.app_utils`, `arduino.app_bricks.video_objectdetection`) are part of the Arduino SDK.
+
+Only standard libraries are used: `datetime`, `time`, `threading`, `math`, `os`, `sys`, `functools`.
+
+---
+
+## How to Upload and Run
+
+1. Open **Arduino Lab** (or Arduino IDE with UNO Q support).
+2. Upload the sketch `sketch/sketch.ino` to the board.
+3. The Python app `python/main.py` is automatically started by the Arduino environment on the MPU side.
+4. Real-time logs are also written to `python/robot.log` (with timestamp).
+
+---
+
+## Robot Setup (First Power-On or Reset)
+
+On startup, the robot automatically enters **setup mode**. The onboard matrix shows the current step (**S1**, **S2**, **S3**).
+
+STS3215 servo torque is **disabled**: you can move the arm freely by hand.
+
+### Step S1 – HOME Position
+
+1. Move the arm by hand to the HOME position (upright, centered).
+2. Hold it steady for **5 seconds** → the matrix blinks the step number during the countdown.
+3. Once captured, the robot nods with servo 4 to confirm, then moves to S2.
+
+### Step S2 – Slot Positions (up to 9)
+
+1. Move the arm toward the **first slot** (where the pens are).
+2. Hold it steady for **5 seconds** → slot captured, the robot returns to HOME and nods.
+3. Repeat for each following slot (up to a maximum of **9 slots**).
+4. After the last slot, the robot returns to HOME and shows **S3** → setup complete.
+
+> The system ignores small vibrations and microadjustments: it waits for real manual movement before starting the countdown.
+
+### Step S3 – Setup Complete
+
+The robot enters **detect** state and is operational.
+
+---
+
+## Normal Operation
 
 ```
-setup → detect → grab → delivery → (viso rilevato) → release → detect → ...
+setup → detect → grab → delivery → (face detected) → release → detect → ...
 ```
 
-| Stato | Cosa fa | Display |
+| State | What it does | Display |
 |---|---|---|
-| **detect** | Attende il rilevamento di un viso; animazione idle sui servo | Occhi che lampeggiano, matrice **D** |
-| **grab** | Raccoglie la penna dallo slot corrente (rotazione base → discesa → chiusura gripper → HOME) | Occhi fissi, matrice **G** |
-| **delivery_waiting** | Attende al HOME con la penna in mano che arrivi un viso | Occhi fissi |
-| **release** | Rileva il viso → mostra cuori, apre il gripper, consegna la penna | Occhi a cuore, matrice **R** |
+| **detect** | Awaits face detection; idle animation on servos | Blinking eyes, matrix **D** |
+| **grab** | Collects pen from current slot (base rotation → descent → gripper close → HOME) | Fixed eyes, matrix **G** |
+| **delivery_waiting** | Waits at HOME with pen in hand for a face to arrive | Fixed eyes |
+| **release** | Detects face → shows hearts, opens gripper, delivers pen | Heart eyes, matrix **R** |
 
-### Dettaglio ciclo grab
+### Grab Cycle Details
 
-1. Rotazione della base verso lo slot
-2. Discesa parziale (50% del percorso)
-3. Apertura stretta del gripper (~165°)
-4. Discesa completa allo slot
-5. Chiusura gripper (180° × 3 tentativi)
-6. Ritorno a HOME
-7. Attesa del viso per la consegna
+1. Base rotation toward slot
+2. Partial descent (50% travel)
+3. Gripper soft open (~165°)
+4. Full descent to slot
+5. Gripper close (180° × 3 attempts)
+6. Return to HOME
+7. Wait for face for delivery
 
-I sensori di pressione su A0/A1 vengono letti prima e dopo la chiusura del gripper (log: `[GRAB][PRESSURE]`).
+Pressure sensors on A0/A1 are read before and after gripper close (log: `[GRAB][PRESSURE]`).
 
-### Animazione idle
+### Idle Animation
 
-Quando è in stato **detect**, il braccio esegue un'oscillazione sinusoidale morbida su tutti e 4 i servo (periodo 10 s), poi torna alla HOME e si ferma 30 s prima di ripetere.
+When in **detect** state, the arm performs smooth sinusoidal oscillation on all 4 servos (period 10 s), then returns to HOME and stops for 30 s before repeating.
 
 ---
 
-## Codici errore (display onboard)
+## Error Codes (Onboard Display)
 
-| Display | Codice | Causa |
+| Display | Code | Cause |
 |---|---|---|
-| `ER1` | Setup pose unavailable | Uno o più STS3215 non rispondono al ping durante il setup |
-| `ER2` | Grab slot not configured | Grab richiesto ma nessuno slot catturato |
-| `ER3` | STS move failed | Comando di movimento STS fallito |
-| `ER4` | *(deprecato)* | Matrix unavailable |
-| `ER5` | Pressure read failed | Errore lettura sensori di pressione |
+| `ER1` | Setup pose unavailable | One or more STS3215 don't respond to ping during setup |
+| `ER2` | Grab slot not configured | Grab requested but no slot configured |
+| `ER3` | STS move failed | STS movement command failed |
+| `ER4` | *(deprecated)* | Matrix unavailable |
+| `ER5` | Pressure read failed | Pressure sensor read error |
 
 ---
 
-## Log e debug
+## Logging and Debug
 
-- I log vengono scritti sia su console che su `python/robot.log` (ogni riga ha timestamp `HH:MM:SS.mmm`).
-- Puoi impostare un percorso custom con la variabile d'ambiente `ROBOT_LOG_PATH`.
-- I log STS3215 mostrano ping e posizione di ogni servo all'avvio (`[STS3215] Check servo`).
+- Logs are written to both console and `python/robot.log` (each line has timestamp `HH:MM:SS.mmm`).
+- You can set a custom path with the `ROBOT_LOG_PATH` environment variable.
+- STS3215 logs show ping and position of each servo on startup (`[STS3215] Check servo`).
 
 ---
 
-## Struttura del progetto
+## Project Structure
 
 ```
 sketch/
-  sketch.ino         # Firmware Arduino (MCU): servo, STS3215, LED matrix, Bridge
+  sketch.ino         # Arduino firmware (MCU): servo, STS3215, LED matrix, Bridge
 python/
-  main.py            # App Python (MPU): face detection, state machine, idle animation
-  robot.log          # Log runtime (generato automaticamente)
+  main.py            # Python app (MPU): face detection, state machine, idle animation
+  robot.log          # Runtime log (auto-generated)
 images/
   arduino_robotic_arm_github_cover.png
 ```
