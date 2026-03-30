@@ -52,6 +52,7 @@ I2C (SDA/SCL) → Modulino LED Matrix (head)
 | 12V 10A Power Supply | 1 | [Buy on Amazon](https://www.amazon.it/dp/B0D1VHNF9R?ref=ppx_yo2ov_dt_b_fed_asin_title) |
 | Lemorele USB-C Docking Station | 1 | [Buy on Amazon](https://www.amazon.it/dp/B08GM2H1Q2?ref=ppx_yo2ov_dt_b_fed_asin_title&th=1) |
 | Micro Servo Metal Gear 90° | 1 | [Buy on Amazon](https://www.amazon.it/dp/B0C38H8TBY?ref=ppx_yo2ov_dt_b_fed_asin_title&th=1) |
+| USB Camera | 1 | [Buy on Amazon](https://www.amazon.it/dp/B0DNT67G7C?ref=ppx_yo2ov_dt_b_fed_asin_title) |
 | M3 Screws | Various | Common hardware store |
 | Power Supply Wires | As needed | Common hardware store |
 | Power Cable 18/16 AWG | 1 roll | Common hardware store |
