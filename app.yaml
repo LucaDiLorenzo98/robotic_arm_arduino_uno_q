@@ -1,8 +1,7 @@
-name: Face Detection Servo
+name: A Robot Arm That Sees You — Built with Arduino UNO Q & Modulino LedMatrix
 icon: 🤖
-description: Move a servo on pin 9 when a face is detected. Uses Video Object Detection, Web UI, and Bridge (MCU/MPU).
+description: A robot arm that recognizes people and delivers gadgets to them — no buttons, no commands, just interaction. Built with the new Arduino UNO Q 4GB and the new Modulino LedMatrix, which gives the robot its friendly face. The arm runs on Feetech digital servo motors with a Waveshare control board, and a camera on the head handles the recognition. From high school tinkering to projects like this — this is what Arduino made possible for me.
 
 bricks:
   - arduino:video_object_detection:
       model: face-detection
-  - arduino:web_ui
