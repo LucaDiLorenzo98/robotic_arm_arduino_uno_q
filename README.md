@@ -33,8 +33,8 @@ A robot arm that recognizes people and delivers gadgets to them — no buttons, 
 D9         → gripper servo signal (PWM)
 A0         → pressure sensor 1
 A1         → pressure sensor 2
-Serial     → STS3215 bus (1 Mbit/s, half-duplex)
-I2C (SDA/SCL) → Modulino LED Matrix (head)
+Serial (pins 0 & 1) → STS3215 bus (1 Mbit/s, half-duplex)
+Modulino Quick Connector → Modulino LED Matrix (head, I2C)
 ```
 
 ---
@@ -74,7 +74,7 @@ I2C (SDA/SCL) → Modulino LED Matrix (head)
 | Component | Material | Notes |
 |---|---|---|
 | Arm structure, base, covers | **PETG HF** | Resistant, good rigidity, high temperatures |
-| Flexible joints, shock absorbers | **TPU 95A** | Elastic, shock-absorbing, suitable for repeated movements |
+| Gripper components (gripper_*) | **TPU 95A** | Elastic, shock-absorbing, suitable for repeated movements |
 
 ---
 
