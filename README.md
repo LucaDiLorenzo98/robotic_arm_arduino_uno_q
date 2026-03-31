@@ -39,6 +39,20 @@ Modulino Quick Connector → Modulino LED Matrix (head, I2C)
 
 ---
 
+## Electrical Schematic
+
+![Electrical Schematic Diagram](images/DIAGRAMMA%20ELETTRICO%20ROBOT%20ARDUINO.png)
+
+The schematic above shows the complete electrical connections for the robot, including:
+- **Arduino UNO Q** as the main control board
+- **STS3215 servo motors** (4×) connected via the Waveshare driver board on the half-duplex serial bus at 1 Mbit/s
+- **PWM servo** for gripper control on digital pin D9
+- **Pressure sensors** (2×) on analog inputs A0 and A1
+- **Power distribution** from a 12V 10A power supply
+- **Modulino LED Matrix** connected via I2C on the Quick Connector for the head display
+
+---
+
 ## Bill of Materials (Non-Printed Components)
 
 | Component | Qty | Link |
@@ -49,10 +63,12 @@ Modulino Quick Connector → Modulino LED Matrix (head, I2C)
 | Waveshare Serial Bus Servo Driver Board | 1 | [Buy on Amazon](https://www.amazon.it/dp/B0CJ6TP3TP?ref=ppx_yo2ov_dt_b_fed_asin_title) |
 | Ball Bearing | 1 | [Buy on AliExpress](https://it.aliexpress.com/item/1005009736872307.html?spm=a2g0o.order_list.order_list_main.74.6c1d3696TBFRL9&gatewayAdapt=glo2ita) |
 | Pressure Sensors | 2 | [Buy on AliExpress](https://it.aliexpress.com/item/1005009958997279.html?spm=a2g0o.order_list.order_list_main.36.6c1d3696TBFRL9&gatewayAdapt=glo2ita) |
-| 12V 10A Power Supply | 1 | [Buy on Amazon](https://www.amazon.it/dp/B0D1VHNF9R?ref=ppx_yo2ov_dt_b_fed_asin_title) |
+| 12V 10A Power Supply | 1 | [Buy on Amazon](https://www.amazon.it/-/en/dp/B0D1VHNF9R?ref_=ppx_hzsearch_conn_dt_b_fed_asin_title_1) |
+| DC Converter 12V to 5V 3A | 1 | [Buy on Amazon](https://www.amazon.it/dp/B08MWK3VKC?ref=ppx_yo2ov_dt_b_fed_asin_title) |
 | Lemorele USB-C Docking Station | 1 | [Buy on Amazon](https://www.amazon.it/dp/B08GM2H1Q2?ref=ppx_yo2ov_dt_b_fed_asin_title&th=1) |
 | Micro Servo Metal Gear 90° | 1 | [Buy on Amazon](https://www.amazon.it/dp/B0C38H8TBY?ref=ppx_yo2ov_dt_b_fed_asin_title&th=1) |
 | USB Camera | 1 | [Buy on Amazon](https://www.amazon.it/dp/B0DNT67G7C?ref=ppx_yo2ov_dt_b_fed_asin_title) |
+| Resistors Kit | 1 | Common electronics store |
 | M3 Screws | Various | Common hardware store |
 | Power Supply Wires | As needed | Common hardware store |
 | Power Cable 18/16 AWG | 1 roll | Common hardware store |
