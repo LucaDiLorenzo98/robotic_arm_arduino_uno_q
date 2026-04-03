@@ -94,6 +94,52 @@ The schematic above shows the complete electrical connections for the robot, inc
 
 ---
 
+## ⚠️ Pre-Assembly: Servo ID Configuration (MANDATORY)
+
+> **This step must be completed BEFORE assembling the robot.**
+> If you skip it, the firmware won't be able to address the servos and nothing will work.
+
+Each STS3215 servo ships from the factory with **ID 1**. Since all 4 motors share the same serial bus, each one must have a unique ID (1, 2, 3, 4) before they are wired together. You must configure them **one at a time**, while they are still unassembled.
+
+### What you need
+
+- The Waveshare Serial Bus Servo Driver Board
+- One STS3215 servo connected to it (just one at a time)
+- A USB cable to power/connect the board
+- The sketch `sc_servo_change_id/sc_servo_change_id.ino` from this repo
+
+### Procedure (repeat for each of the 4 servos)
+
+1. **Connect only one servo** to the Waveshare board. Do not connect the others.
+2. Open `sc_servo_change_id/sc_servo_change_id.ino` in Arduino IDE.
+3. At the top of the sketch, set the two ID variables:
+
+   ```cpp
+   int idAttuale = 1;  // Factory default for a brand-new servo is always 1
+   int idNuovo   = 1;  // The ID you want to assign to this servo
+   ```
+
+   | Servo | `idAttuale` | `idNuovo` |
+   |---|---|---|
+   | 1st servo | `1` | `1` |
+   | 2nd servo | `1` | `2` |
+   | 3rd servo | `1` | `3` |
+   | 4th servo | `1` | `4` |
+
+4. Upload and run the sketch. Open the **Serial Monitor** at 115200 baud.
+5. If successful, you'll see:
+   ```
+   SUCCESSO! Il servo ora ha l'ID: X
+   Ora puoi scollegarlo e passare al prossimo.
+   ```
+6. **Disconnect** the servo, connect the next one, update `idNuovo` in the sketch, and repeat.
+
+> If the Serial Monitor shows `ERRORE: Servo non rilevato`, check the 12V power supply to the Waveshare board and verify the connection to the servo. Make sure `idAttuale` matches the servo's current ID (new servos always start at 1).
+
+Once all 4 servos have their IDs assigned, you can proceed with mechanical assembly and wire them all together on the bus.
+
+---
+
 ## Arduino Libraries to Install
 
 Open **Tools → Manage Libraries** in Arduino IDE / Arduino Lab and install:
