@@ -193,12 +193,17 @@ void _safeAttach() {
 }
 
 // Called from Python when a face is detected. Angle in degrees (0-180).
+// Ramps in 1° steps to reduce vibration and oscillation.
 int move_servo(int angle) {
   if (angle < 0) angle = 0;
   if (angle > 180) angle = 180;
   _safeAttach();
-  servo.write(angle);
-  lastServoAngle = angle;
+  int step = (angle > lastServoAngle) ? 1 : -1;
+  while (lastServoAngle != angle) {
+    lastServoAngle += step;
+    servo.writeMicroseconds(_angleToUs(lastServoAngle));
+    delay(8);  // ~120°/s — abbassa per movimenti più lenti, alza per più veloci
+  }
   return 1;
 }
 
@@ -480,7 +485,7 @@ void setup() {
 
   // Standard PWM servo on D9 (gripper) — start at 180° (closed)
   servo.attach(SERVO_PIN, 500, 2500);
-  servo.write(lastServoAngle);  // 180 = closed
+  servo.writeMicroseconds(_angleToUs(lastServoAngle));  // 180 = closed
 
   // STS3215 serial bus on Serial (UNO Q side)
   Serial.begin(1000000);
