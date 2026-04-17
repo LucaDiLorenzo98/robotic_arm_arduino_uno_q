@@ -99,8 +99,6 @@ _enable_unbuffered_console_and_file_log()
 # Ensure every print flushes by default (helps with buffered stdout).
 print = partial(print, flush=True)
 
-POSITIONS_FILE = os.path.join(os.path.dirname(__file__), "positions.txt")
-
 # ID dei servo STS3215 (solo 4 presenti sul bus)
 STS_SERVO_IDS = (1, 2, 3, 4)
 STS_CHECK_IDS = STS_SERVO_IDS
@@ -131,7 +129,6 @@ def _print_sts_servo_info():
 
 def _startup_sts_check():
     """Esegue il check STS dopo un breve delay (Bridge deve essere connesso)."""
-    global HOME_POSITION, SLOT_POSITIONS, _slot_grab_count
     try:
         time.sleep(STS_STARTUP_DELAY_SEC)
         # Initialize LED matrix now that Bridge is ready.
@@ -140,36 +137,22 @@ def _startup_sts_check():
             led_matrix_set_state_name(STATE_SETUP)
         except Exception:
             pass
-
+        # Clear indication: now it's safe to start setup and move the robot by hand.
+        core_matrix_set_setup_step(1)
+        print("[SETUP] Move robot to HOME, then hold still 5s.")
+        print(f"[SETUP] Then move robot to each of the {GRAB_SLOT_COUNT_MAX} slots, holding still 5s each.")
+        # Ready for setup: nod + open gripper slightly
+        _set_sts_torque_enabled(True)
+        _setup_nod_servo4()
+        _set_sts_torque_enabled(False)
+        _set_gripper_setup_open_free()
         all_ok = _print_sts_servo_info()
         if not all_ok:
             core_matrix_set_error_code(ERR_SETUP_POSE_UNAVAILABLE)
             print(
                 "[SETUP][ERROR] One or more STS3215 servos did not respond (check wiring/half-duplex adapter/IDs)."
             )
-
-        # Try to restore positions from disk and skip setup.
-        loaded = _load_positions() if all_ok else None
-        if loaded:
-            HOME_POSITION, SLOT_POSITIONS = loaded
-            _slot_grab_count = 0
-            print(
-                f"[SETUP] Restored from file: home={HOME_POSITION}, {len(SLOT_POSITIONS)} slot(s). Skipping setup."
-            )
-            _set_sts_torque_enabled(True)
-            _move_arm_to_pose(HOME_POSITION, speed=HOME_MOVE_SPEED, acc=HOME_MOVE_ACC)
-            core_matrix_set_setup_step(3)
-            _set_state(STATE_DETECT)
-        else:
-            # Normal setup flow: torque-free so the arm can be moved by hand.
-            core_matrix_set_setup_step(1)
-            print("[SETUP] Move robot to HOME, then hold still 5s.")
-            print(f"[SETUP] Then move robot to each of the {GRAB_SLOT_COUNT_MAX} slots, holding still 5s each.")
-            _set_sts_torque_enabled(True)
-            _setup_nod_servo4()
-            _set_sts_torque_enabled(False)
-            _set_gripper_setup_open_free()
-            print("[SETUP] READY: you can move the arm now.")
+        print("[SETUP] READY: you can move the arm now.")
     except Exception as e:
         print(f"[STS3215] startup check failed: {e}")
     finally:
@@ -370,76 +353,6 @@ def _pose_payload(pose: dict[int, int]) -> dict[str, int]:
     return {str(k): int(v) for k, v in pose.items()}
 
 
-def _save_positions() -> bool:
-    """Persist HOME_POSITION and SLOT_POSITIONS to disk after a successful setup.
-
-    Format (one line per entry):
-        home <v1> <v2> <v3> <v4>
-        slot <v1> <v2> <v3> <v4>
-        slot <v1> <v2> <v3> <v4>
-        ...
-    Values are servo positions in order of STS_SERVO_IDS.
-    """
-    try:
-        lines = []
-        lines.append("home " + " ".join(str(HOME_POSITION[sid]) for sid in STS_SERVO_IDS))
-        for s in SLOT_POSITIONS:
-            lines.append("slot " + " ".join(str(s[sid]) for sid in STS_SERVO_IDS))
-        with open(POSITIONS_FILE, "w", encoding="utf-8") as f:
-            f.write("\n".join(lines) + "\n")
-        print(f"[SETUP] Positions saved to {POSITIONS_FILE}")
-        return True
-    except Exception as e:
-        print(f"[SETUP] Failed to save positions: {e}")
-        return False
-
-
-def _load_positions() -> tuple[dict[int, int], list[dict[int, int]]] | None:
-    """Load and validate positions from disk. Returns (home, slots) or None."""
-    try:
-        with open(POSITIONS_FILE, "r", encoding="utf-8") as f:
-            lines = [l.strip() for l in f if l.strip()]
-    except FileNotFoundError:
-        return None
-    except Exception as e:
-        print(f"[SETUP] Could not read positions file: {e}")
-        return None
-
-    home: dict[int, int] | None = None
-    slots: list[dict[int, int]] = []
-    for line in lines:
-        parts = line.split()
-        if len(parts) != 1 + len(STS_SERVO_IDS):
-            print(f"[SETUP] positions.txt: bad line {line!r} — will run setup.")
-            return None
-        keyword, values = parts[0], parts[1:]
-        try:
-            pose = {sid: int(v) for sid, v in zip(STS_SERVO_IDS, values)}
-        except ValueError:
-            print(f"[SETUP] positions.txt: non-integer value in {line!r} — will run setup.")
-            return None
-        validated = _validated_home_position(pose)
-        if not validated:
-            print(f"[SETUP] positions.txt: out-of-range value in {line!r} — will run setup.")
-            return None
-        if keyword == "home":
-            home = validated
-        elif keyword == "slot":
-            slots.append(validated)
-        else:
-            print(f"[SETUP] positions.txt: unknown keyword {keyword!r} — will run setup.")
-            return None
-
-    if home is None:
-        print("[SETUP] positions.txt: home line missing — will run setup.")
-        return None
-    if not slots:
-        print("[SETUP] positions.txt: no slot lines — will run setup.")
-        return None
-
-    return home, slots
-
-
 def _pause_idle_temporarily():
     global _idle_pause_until
     _idle_pause_until = time.time() + IDLE_ANIM_PAUSE_AFTER_MANUAL_SEC
@@ -637,7 +550,6 @@ def _handle_setup_phase():
             _setup_torque_free_active = False
             print(f"[SETUP] All {GRAB_SLOT_COUNT_MAX} slots captured. Returning to HOME.")
             _move_arm_then_base(HOME_POSITION, speed=HOME_MOVE_SPEED, acc=HOME_MOVE_ACC, lift_pose=HOME_POSITION)
-            _save_positions()
             core_matrix_set_setup_step(3)
             _set_state(STATE_DETECT)
 
